@@ -1,0 +1,10 @@
+pyrealsense2==2.59.1.11053
+opencv-python==4.11.0.86
+numpy==2.3.5
+pytest==8.4.2
+# Pillow is needed by the tests to render reference PNGs via charuco_generator;
+# the conflicting opencv-contrib-python-headless is intentionally omitted.
+Pillow==12.0.0
+# charuco-generator is installed separately with --no-deps (it provides its own
+# OpenCV pin that conflicts with the GUI build needed for the stream command):
+#   pip install -e ../charuco-generator --no-deps
