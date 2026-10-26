@@ -1,8 +1,4 @@
-"""Intel RealSense (D435i) capture via pyrealsense2.
-
-pyrealsense2 is imported lazily so image-only workflows (detect --image, tests)
-run without the RealSense runtime or hardware.
-"""
+"""Intel RealSense capture; the SDK is imported only when hardware is used."""
 from dataclasses import dataclass
 
 import numpy as np
@@ -17,118 +13,198 @@ class StreamConfig:
     width: int = 1280
     height: int = 720
     fps: int = 30
+    depth: bool = False
+
+    def __post_init__(self):
+        if any(not isinstance(v, int) or v <= 0 for v in (self.width, self.height, self.fps)):
+            raise ValueError("Stream width, height and fps must be positive integers")
 
 
 @dataclass(frozen=True)
 class Frame:
     bgr: np.ndarray
-    intrinsics: dict  # fx, fy, ppx, ppy, width, height
+    intrinsics: dict
     timestamp_ms: float
+    frame_number: int = 0
+    timestamp_domain: str = "unknown"
 
 
 def _realsense():
     try:
         import pyrealsense2 as rs
     except ImportError as exc:
-        raise CameraError(
-            "pyrealsense2 is not installed; run: pip install pyrealsense2") from exc
+        raise CameraError("pyrealsense2 is not installed; run: pip install pyrealsense2") from exc
     return rs
+
+
+def _device_info(rs, device):
+    result = {}
+    for key in ("name", "serial_number", "firmware_version", "physical_port", "usb_type_descriptor"):
+        option = getattr(rs.camera_info, key)
+        if device.supports(option):
+            result[{"firmware_version": "firmware", "usb_type_descriptor": "usb_type"}.get(key, key)] = device.get_info(option)
+    return result
 
 
 def list_devices() -> list[dict]:
     rs = _realsense()
-    devices = []
-    for device in rs.context().query_devices():
-        devices.append({
-            "name": device.get_info(rs.camera_info.name),
-            "serial_number": device.get_info(rs.camera_info.serial_number),
-            "firmware": device.get_info(rs.camera_info.firmware_version),
-            "physical_port": device.get_info(rs.camera_info.physical_port),
-            "usb_type": device.get_info(rs.camera_info.usb_type_descriptor),
-        })
-    return devices
+    try:
+        return [_device_info(rs, device) for device in rs.context().query_devices()]
+    except RuntimeError as exc:
+        raise CameraError(f"Cannot list RealSense devices: {exc}") from exc
 
 
-# (color_w, color_h, color_fps, depth_w, depth_h, depth_fps); USB 2.0 ports cap
-# the D435i well below 1280x720@30, so fall back until one profile resolves.
-_FALLBACKS = (
-    (1280, 720, 15, 640, 480, 15),
-    (640, 480, 30, 640, 480, 30),
-    (848, 480, 10, 848, 480, 10),
-)
+# color_w/h/fps, depth_w/h/fps (depth is optional).
+_FALLBACKS = ((1280, 720, 15, 640, 480, 15),
+              (640, 480, 30, 640, 480, 30),
+              (848, 480, 10, 848, 480, 10))
 
 
 class RealsenseCamera:
-    """RGB stream from a single RealSense device.
-
-    Depth is enabled as well so downstream code can fuse it later; only RGB is
-    exposed for now (ChArUco detection runs on the color stream).
-    """
+    """A selected device's color stream, with optional depth for future fusion."""
 
     def __init__(self, serial: str | None = None, config: StreamConfig = StreamConfig()):
-        rs = _realsense()
-        self._rs = rs
-        self._ctx = rs.context()
-        self._device = self._select_device(serial)
-        self._pipeline = rs.pipeline(self._ctx)
-        requested = (config.width, config.height, config.fps,
-                     config.width, config.height, config.fps)
-        candidates = [requested] + [c for c in _FALLBACKS if c != requested]
-        last_error: RuntimeError | None = None
-        for cw, ch, cfps, dw, dh, dfps in candidates:
-            pipeline_config = rs.config()
-            pipeline_config.enable_stream(rs.stream.color, cw, ch, rs.format.rgb8, cfps)
-            pipeline_config.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, dfps)
-            try:
-                self._pipeline.start(pipeline_config)
-            except RuntimeError as exc:
-                last_error = exc
-                continue
-            self.stream_info = f"color {cw}x{ch}@{cfps} + depth {dw}x{dh}@{dfps}"
-            return
-        raise CameraError(
-            f"No stream profile resolved on this connection (last error: {last_error}); "
-            "USB 2.0 ports limit the D435i, try a USB 3.0 port or lower --width/--height")
+        self._rs = rs = _realsense()
+        self._started = False
+        self._restore_options = []
+        try:
+            self._ctx = rs.context()
+            self._device = self._select_device(serial)
+            self.serial = self._device.get_info(rs.camera_info.serial_number)
+            self._pipeline = rs.pipeline(self._ctx)
+            requested = (config.width, config.height, config.fps,
+                         config.width, config.height, config.fps)
+            candidates = [requested] + [c for c in _FALLBACKS if c != requested]
+            last_error = None
+            for cw, ch, cfps, dw, dh, dfps in candidates:
+                pipeline_config = rs.config()
+                pipeline_config.enable_device(self.serial)
+                pipeline_config.enable_stream(rs.stream.color, cw, ch, rs.format.rgb8, cfps)
+                if config.depth:
+                    pipeline_config.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, dfps)
+                try:
+                    profile = self._pipeline.start(pipeline_config)
+                except RuntimeError as exc:
+                    last_error = exc
+                    continue
+                self._started = True
+                self._device = profile.get_device()
+                color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+                intr = color_profile.get_intrinsics()
+                self._intrinsics = {
+                    "fx": intr.fx, "fy": intr.fy, "ppx": intr.ppx, "ppy": intr.ppy,
+                    "width": intr.width, "height": intr.height,
+                    "model": str(intr.model).removeprefix("distortion."),
+                    "coeffs": list(intr.coeffs),
+                }
+                self.actual_config = {"width": intr.width, "height": intr.height,
+                                      "fps": color_profile.fps(), "depth": config.depth}
+                self.stream_info = f"color {intr.width}x{intr.height}@{color_profile.fps()}"
+                if config.depth:
+                    depth = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+                    self.actual_config["depth_profile"] = {"width": depth.width(), "height": depth.height(), "fps": depth.fps()}
+                    self.stream_info += f" + depth {depth.width()}x{depth.height()}@{depth.fps()}"
+                return
+            raise CameraError(f"No stream profile resolved (last error: {last_error}); "
+                              "try USB 3.0, a lower profile, or disabling --depth")
+        except RuntimeError as exc:
+            self.close()
+            if isinstance(exc, CameraError):
+                raise
+            raise CameraError(f"Cannot start RealSense camera: {exc}") from exc
 
     def _select_device(self, serial: str | None):
         devices = self._ctx.query_devices()
         if not devices:
-            raise CameraError(
-                "No RealSense device found; connect the D435i, check the USB cable "
-                "(USB 3.0) and that no other process holds the camera")
-        serial_of = lambda d: d.get_info(rs.camera_info.serial_number)
+            raise CameraError("No RealSense device found; connect it and check the USB cable")
+        serials = [d.get_info(self._rs.camera_info.serial_number) for d in devices]
         if serial is None:
             if len(devices) > 1:
-                found = [serial_of(d) for d in devices]
-                raise CameraError(f"{len(devices)} RealSense devices connected; select one with --serial {found}")
+                raise CameraError(f"Multiple RealSense devices connected; select --serial from {serials}")
             return devices[0]
-        for device in devices:
-            if serial_of(device) == serial:
+        for device, candidate in zip(devices, serials):
+            if candidate == serial:
                 return device
-        available = [serial_of(d) for d in devices]
-        raise CameraError(f"RealSense serial {serial!r} not found; available: {available}")
+        raise CameraError(f"RealSense serial {serial!r} not found; available: {serials}")
 
     @property
     def intrinsics(self) -> dict:
-        profile = self._pipeline.get_active_profile().get_stream(self._rs.stream.color)
-        intr = profile.as_video_stream_profile().get_intrinsics()
-        return {"fx": intr.fx, "fy": intr.fy, "ppx": intr.ppx, "ppy": intr.ppy,
-                "width": intr.width, "height": intr.height}
+        return {**self._intrinsics, "coeffs": list(self._intrinsics["coeffs"])}
+
+    def _color_sensor(self):
+        rs = self._rs
+        for sensor in self._device.query_sensors():
+            if any(p.stream_type() == rs.stream.color for p in sensor.get_stream_profiles()):
+                return sensor
+        raise CameraError("No color sensor available")
+
+    def lock_exposure(self):
+        """Freeze settled auto exposure/gain and restore auto mode on close."""
+        rs = self._rs
+        sensor = self._color_sensor()
+        option = rs.option.enable_auto_exposure
+        if not sensor.supports(option):
+            raise CameraError("Color sensor does not support locking auto exposure")
+        try:
+            previous = sensor.get_option(option)
+            manual = [(getattr(rs.option, name), sensor.get_option(getattr(rs.option, name)))
+                      for name in ("exposure", "gain") if sensor.supports(getattr(rs.option, name))]
+            sensor.set_option(option, 0.0)
+            self._restore_options.append((sensor, option, previous))
+            for manual_option, value in manual:
+                self._restore_options.append((sensor, manual_option, value))
+                sensor.set_option(manual_option, value)
+        except RuntimeError as exc:
+            raise CameraError(f"Cannot lock color exposure: {exc}") from exc
+
+    @property
+    def metadata(self) -> dict:
+        rs = self._rs
+        settings = {}
+        try:
+            sensor = self._color_sensor()
+            for name in ("enable_auto_exposure", "exposure", "gain", "enable_auto_white_balance", "white_balance"):
+                option = getattr(rs.option, name)
+                if sensor.supports(option):
+                    settings[name] = float(sensor.get_option(option))
+            return {"device": _device_info(rs, self._device), "stream": self.actual_config,
+                    "stream_info": self.stream_info, "intrinsics": self.intrinsics,
+                    "color_settings": settings}
+        except RuntimeError as exc:
+            raise CameraError(f"Cannot read camera metadata: {exc}") from exc
 
     def read(self) -> Frame:
-        frames = self._pipeline.wait_for_frames()
-        color = frames.get_color_frame()
-        if not color:
-            raise CameraError("No color frame from RealSense pipeline")
-        bgr = np.ascontiguousarray(color.get_data())[:, :, ::-1]  # rgb8 -> BGR
-        return Frame(
-            bgr=bgr,
-            intrinsics=self.intrinsics,
-            timestamp_ms=float(color.get_timestamp()),
-        )
+        try:
+            frames = self._pipeline.wait_for_frames(timeout_ms=5000)
+            color = frames.get_color_frame()
+            if not color:
+                raise CameraError("No color frame from RealSense pipeline")
+            # Copy owns the buffer and produces contiguous BGR data for OpenCV.
+            bgr = np.ascontiguousarray(np.asanyarray(color.get_data())[:, :, ::-1])
+            return Frame(bgr=bgr, intrinsics=self.intrinsics,
+                         timestamp_ms=float(color.get_timestamp()),
+                         frame_number=int(color.get_frame_number()),
+                         timestamp_domain=str(color.get_frame_timestamp_domain()))
+        except RuntimeError as exc:
+            if isinstance(exc, CameraError):
+                raise
+            raise CameraError(f"Cannot read RealSense frame: {exc}") from exc
 
     def close(self) -> None:
-        self._pipeline.stop()
+        try:
+            for sensor, option, value in reversed(self._restore_options):
+                try:
+                    sensor.set_option(option, value)
+                except RuntimeError:
+                    pass  # A disconnected device may no longer accept options.
+            self._restore_options.clear()
+        finally:
+            if self._started:
+                self._started = False
+                try:
+                    self._pipeline.stop()
+                except RuntimeError:
+                    pass
 
     def __enter__(self) -> "RealsenseCamera":
         return self

@@ -1,82 +1,313 @@
 # charuco-realsense
 
 Detect [charuco-generator](../charuco-generator) ChArUco boards with an Intel
-RealSense D435i, and estimate the board pose with `cv2.solvePnP`.
+RealSense D435i, estimate pose, and record recognition reliability, corner jitter,
+pose jitter, and accuracy against an independent reference pose.
 
-The detection core works on any image (PNG/JPG) or on the live color stream.
-The camera layer uses `pyrealsense2` and is imported lazily, so offline
-workflows and tests run without RealSense hardware or the RealSense runtime.
+Detection works on PNG/JPG images and the live color stream. `pyrealsense2` is
+imported lazily, so offline detection, recording analysis, and tests do not require
+camera hardware or the RealSense runtime.
 
 ## Setup
 
 ```sh
-cd ~/development/charuco-realsense
 python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/pip install -e ../charuco-generator --no-deps
 .venv/bin/pip install -e .
 ```
 
-`charuco-generator` is installed with `--no-deps` on purpose: it pins
-`opencv-contrib-python-headless`, which conflicts with the GUI `opencv-python`
-build this repo needs for `stream`. The generator's runtime imports that this
-repo uses (`create_board`, `layout_record`, `reconstruct_board`, `render_png`)
-only require `cv2` and `numpy`, which `opencv-python==4.11.0` provides.
+The generator is installed with `--no-deps` because its headless OpenCV dependency
+conflicts with this project's GUI OpenCV build. `./start_camera.sh` can also set
+up the environment and run any command below.
 
 ## Usage
 
 ```sh
-# List connected RealSense devices
+# Open the desktop UI (also the default for ./start_camera.sh)
+./start_camera.sh
+# Or explicitly select a board
+.venv/bin/python main.py gui --board front
+
 .venv/bin/python main.py list
 
-# Detect in an image (offline; the default manifest is the sibling checkout)
+# Offline recognition
 .venv/bin/python main.py detect --board front \
   --image ../charuco-generator/output/front_charuco.png
 
-# Detect from the camera (best of N frames by corner count), with pose
-.venv/bin/python main.py detect --board front --frames 10 --pose
+# Keep the best of ten camera frames; save the corresponding image and report
+.venv/bin/python main.py detect --board front --frames 10 --pose \
+  --save-image output/best.png --report output/detection.json
 
-# Live view with marker/corner overlays (q to quit)
+# Live overlays (q to quit)
 .venv/bin/python main.py stream --board front --pose
+
+# Record every frame for 60 seconds, without a GUI
+.venv/bin/python main.py benchmark --board front --seconds 60 \
+  --output output/run-01
+
+# Record while viewing overlays; pose is enabled automatically
+.venv/bin/python main.py stream --board front --record output/run-02
+
+# Optional raw PNG frames, fixed exposure, planar solver and outlier rejection
+.venv/bin/python main.py benchmark --board front --frames 500 --seconds 120 \
+  --lock-exposure --solver ippe --ransac --refine --save-frames \
+  --output output/run-03
+
+# Recompute statistics later, with no hardware
+.venv/bin/python main.py summarize --record output/run-01 \
+  --report output/run-01/recomputed.json
 ```
 
-`detect` prints a JSON report and exits `0` when at least one expected marker
-is matched, `1` when nothing is found, `2` on configuration/hardware errors.
-Use `--report path` to save the JSON and `--save-image path` to save the
-analyzed frame. `--serial`, `--width`, `--height`, `--fps` select the device
-and stream; `--generator-path` points at a generator checkout when it is not
-installed in the environment.
+Recording directories must be new; existing experiments are never overwritten.
+The recorder creates parent directories. For standalone `detect --report` and
+`--save-image`, create the destination parent directory first.
+
+`benchmark` stops at the first reached `--seconds` or `--frames` limit. Its default
+is 60 seconds; `--frames` alone therefore still has that time limit. `stream` has
+no default limit; it accepts the same optional limits. Ctrl+C finalizes a partial
+recording and returns 130. Camera/processing errors also finalize an active
+recording with status `error`, then return 2. A hard kill or power failure cannot
+run finalization; complete JSONL lines remain available for offline analysis.
+
+`detect` retains its original behavior: exit 0 when any expected marker matches,
+1 when none matches, 2 for configuration/hardware/file errors. `benchmark` and a
+recorded stream return 0 if at least one recorded frame recognizes the board,
+otherwise 1. Recognition success does not imply pose success or accuracy.
+
+## Desktop monitor
+
+Run `./start_camera.sh` to open the UI and connect the camera. Select a board
+before connecting, or disconnect to switch boards. The window shows:
+
+- Live marker outlines and IDs, with ChArUco corners overlaid in green.
+- Matched/missing/foreign marker IDs, corner counts, position, image-fit error,
+  and pose-quality feedback.
+- Time plots of X/Y/Z displacement from the first pose, position RMS jitter,
+  rotation RMS jitter, and corner RMS jitter. Missing observations create gaps.
+- **Start recording** and **Stop & save** controls, a recording timer/frame count,
+  a destination folder picker, and an optional raw-PNG checkbox.
+
+Choose the parent destination folder and press **Start recording**. Each click
+starts a new `run-YYYYMMDD-HHMMSS-...` directory and resets the live history and
+displacement baseline. **Stop & save** finalizes the session while keeping the
+preview running. Disconnecting or closing the window also saves an active
+recording and releases the camera. Camera errors finalize partial recordings.
+
+UI recordings include the normal `session.json`, `frames.jsonl`, and
+`summary.json`, plus **`jitter.csv`** with a row per processed frame: elapsed
+seconds, X/Y/Z displacement, rolling position/rotation/corner jitter, recognition
+and pose-quality flags, and marker/corner counts. The same live measurements are
+stored under `live_jitter` in each JSONL record. Empty CSV cells and JSON nulls
+mean insufficient or missing observations, rather than zero jitter.
+
+The default rolling window is 2 seconds and the chart shows 30 seconds. Change
+them with `gui --rolling-seconds 3 --window-seconds 60`. Rolling position jitter
+is the 3D RMS distance from the window's mean position. Rotation jitter is RMS
+angular distance from the window's mean rotation. Corner jitter is the square
+root of the mean per-ID radial variance for corners observed at least twice in
+the window. These use raw solved poses, including quality-rejected poses; the
+quality indicator remains separate. Keep the camera and board stationary to
+interpret these as jitter. Preview refresh is capped at 10 Hz, independently of
+recording every processed frame.
+
+The UI also accepts the usual camera, calibration, solver and reference-pose
+options, plus `--output-dir` (default `output`) and `--save-frames`. A static
+reference pose and any exposure lock remain fixed until disconnecting. UI chart
+history is bounded to 5,000 samples; the recording retains all processed frames.
+
+Tkinter and Pillow are required for the desktop UI. The setup above includes
+Pillow; package-only installs can use `pip install -e '.[gui]'`. If Tkinter is
+missing, install Tk support for the Python interpreter you use (commonly
+`python3-tk` on Debian/Ubuntu). The `detect`, `benchmark`, and `summarize` commands
+continue to work without Tkinter or a desktop display.
+
+## Recording files
+
+Each recording directory contains:
+
+- `session.json`: schema version, UTC start time, board geometry and IDs, manifest
+  hash, software versions, camera serial/firmware, requested and negotiated stream
+  profiles, native and effective calibration, exposure/gain, detector settings,
+  pose thresholds, reference pose, and recording options.
+- `frames.jsonl`: one entry per processed frame, including unsuccessful frames.
+  Contains hardware frame number, camera timestamp/domain, host monotonic timestamp,
+  elapsed time, processing time, detected/missing/foreign/duplicate marker IDs,
+  marker coordinates, explicit ChArUco ID/coordinate pairs, raw pose, quality
+  reasons, reprojection errors, inliers, coverage, and optional reference errors.
+- `summary.json`: completion status and the statistics below.
+- `images/00000000.png`, etc., only with `--save-frames`: unannotated BGR captures
+  encoded as PNG, referenced by their frame records.
+
+JSONL is flushed after every frame. No temporal smoothing is applied. Logging,
+image encoding, capture, and GUI time are excluded from `processing_ms` but affect
+observed throughput. Per-corner statistics use online moments; pose arrays and
+scalar timing samples remain in memory for exact percentiles and rotation means.
+
+## Interpreting the measurements
+
+| Statistic | Meaning |
+| --- | --- |
+| Recognition, pose-available, quality-pass and full-visibility rates | Counts divided by every processed frame, including failures |
+| Longest dropout | Longest consecutive failure run in processed frames |
+| Camera frame-number gaps/duplicates/resets | Delivery diagnostics; gaps may include frames skipped while processing |
+| Corner jitter | Per-ID mean, sample X/Y standard deviation and radial RMS in pixels, plus observation count and missing rate |
+| Position jitter | Sample X/Y/Z standard deviation, 3D RMS/P95 displacement from the mean, axis peak-to-peak spread, and drift in mm |
+| Rotation jitter | RMS/P95/max angular deviation from the mean rotation and angular drift in degrees |
+| Reprojection error | Distance from an observed corner to its projection through the estimated pose, in pixels |
+| Accuracy | Translation bias and error RMS/P95/max in mm, plus angular error RMS/P95/max in degrees, relative to supplied ground truth |
+
+`all_poses` includes every solved raw pose, even if rejected by quality checks.
+`quality_passed_poses` shows the accepted subset separately. This makes rejection
+rates and the effect of filtering visible. Unsolved poses remain null in the log;
+they are never replaced by the preceding pose or zero coordinates.
+
+Sample standard deviations use N-1. Jitter is null for fewer than two observations;
+accuracy can be evaluated from one observation. Corners are tracked by ID rather
+than array position. Duplicate corner IDs are excluded from corner jitter. The
+rotation mean is projected onto SO(3) using SVD; angular differences are computed
+from relative rotations, avoiding Euler-angle wraparound. Drift compares the
+first and last `max(1, min(30, N // 10))` pose samples, and is expressed at the
+configured board origin. Widely dispersed or multimodal orientations can make a
+single mean rotation unrepresentative; inspect the raw trajectory in that case.
+
+Recognition rates assume the selected board should be visible throughout the run.
+They are not labeled precision/recall or a probability that an ID is correct.
+Foreign marker IDs alone are not proof of a false recognition: another board may
+actually be visible.
+
+## Pose quality and solver choices
+
+The default iterative solver requires at least four non-collinear corners.
+Configurable quality gates default to:
+
+- `--min-corners 6`: minimum inlier corner count.
+- `--min-coverage 0.25`: inlier object-point convex-hull area divided by the hull
+  area of all internal chessboard corners; this is not the outer printed area.
+- `--max-rmse-px 2` and `--max-error-px 5`: maximum RMS and worst inlier residual.
+- `--min-inlier-fraction 0.6`: minimum inlier fraction.
+- All board chessboard corners must project in front of the camera. Duplicate
+  expected marker IDs also fail quality because board association is ambiguous.
+
+These are starting thresholds, not calibrated uncertainty or accuracy guarantees.
+Reports distinguish `board_recognized`, `pose_available`, and
+`pose_quality_passed`. `passed` remains a recognition-only compatibility field.
+
+`--ransac` requires at least six detected corners. It first identifies inliers
+with EPNP RANSAC, then refits with the selected solver. Adjust
+`--ransac-threshold-px` (default 3 px) for the camera and image quality. With RANSAC,
+quality residuals/coverage use inliers, while `all_corner_reprojection_*` fields
+and per-corner error records retain the excluded observations.
+
+`--solver ippe` evaluates both planar pose candidates, prefers positive depth,
+and selects the lowest inlier residual. The log retains candidates and their
+RMSE gap; similar errors can indicate ambiguous orientations. `--refine` applies
+Levenberg-Marquardt refinement to candidates. There is no temporal continuity
+prior concealing jumps. Compare solver choices using stationary recordings.
+
+The detector reuses OpenCV detector objects and runs marker detection once per
+frame. Camera calibration is passed to ChArUco interpolation. Marker corner
+refinement remains disabled; the ChArUco chessboard corners themselves receive
+OpenCV's subpixel refinement.
+
+## Calibration
+
+Native RealSense color intrinsics include their distortion model and coefficients
+and are captured for the actual negotiated profile. Brown-Conrady coefficients
+are supported directly. Brown-Conrady variants with all-zero coefficients are
+equivalent to a pinhole model. Nonzero inverse/modified Brown-Conrady and all
+fisheye models are rejected instead of silently ignored. Zero fisheye coefficients
+still use a different base projection. Use a matching
+OpenCV calibration or rectify images with their actual model before offline use.
+
+To override factory intrinsics, pass `--calibration calibration.json`. This is
+also required for offline `detect --image ... --pose`. Example format (the values
+below are illustrative; replace them with a calibration for your camera):
+
+```json
+{
+  "width": 1280,
+  "height": 720,
+  "fx": 904.3,
+  "fy": 903.2,
+  "ppx": 657.7,
+  "ppy": 363.9,
+  "model": "opencv",
+  "coeffs": [-0.1, 0.02, 0.0, 0.0, 0.0]
+}
+```
+
+`model: "opencv"` accepts 4/5/8/12/14 standard OpenCV distortion coefficients,
+`brown_conrady` accepts five, and `none` requires zero distortion. The file must
+include width and height matching the actual image. A USB profile fallback that
+changes resolution therefore rejects an incompatible calibration rather than
+rescaling it silently. Image size alone cannot verify camera identity or crop;
+use a calibration for the selected camera and exact stream profile.
+
+Library callers may still supply only fx/fy/ppx/ppy to assume a pinhole camera.
+Providing full calibration is preferred for measurements. The factory calibration
+alone does not establish physical measurement accuracy.
+
+## Measuring physical accuracy
+
+1. Measure the printed square spacing and check the board is flat and rigid.
+   The sibling generator currently defines a 100 x 80 mm pattern with 20 mm
+   squares, but the physical print must match its manifest. A 1% print-scale error
+   can cause about 1% distance error with essentially zero reprojection error.
+2. Mount both camera and board rigidly. Let exposure settle; warmup defaults to
+   two seconds and can be increased with `--warmup-seconds`. Optionally use
+   `--lock-exposure` to freeze exposure/gain for the session; original settings
+   are restored on exit when the device is still connected.
+3. Collect 30–60 seconds per stationary setup. Repeat across working distances,
+   tilt angles, lighting, occlusion, and image-center/edge locations. Keep raw
+   estimates when comparing quality thresholds or solver choices.
+4. Establish an independent reference pose in the **color camera coordinate
+   frame**, using the same board origin and axes. The board origin is the outer
+   top-left pattern corner, X right, Y down, Z into the board; `tvec_m` is in
+   metres. A distance measured from the camera housing is not automatically the
+   optical-frame distance. A calibrated translation stage can instead validate
+   known relative movements across separately recorded stationary setups.
+5. Supply a reference file to the recorder or add it when reanalyzing. A static
+   reference is valid only while the camera-to-board pose remains constant.
+   Account for the reference instrument's own uncertainty. RealSense depth is a
+   separate measurement, not automatic ground truth for this color-based pose.
+
+Example reference format (replace with an independently measured pose):
+
+```json
+{
+  "tvec_m": [-0.05, -0.04, 0.5],
+  "rotation_matrix": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+}
+```
+
+A three-element Rodrigues `rvec` in radians can replace `rotation_matrix`.
+Matrices must be finite, orthonormal, and have determinant +1.
+
+```sh
+.venv/bin/python main.py benchmark --board front --seconds 60 \
+  --reference-pose reference.json --output output/accuracy-01
+
+.venv/bin/python main.py summarize --record output/run-01 \
+  --reference-pose reference.json --report output/run-01/accuracy.json
+```
+
+The estimated pose from the first frame is useful as a repeatability reference,
+but cannot serve as independent ground truth. Low jitter and low reprojection
+error can coexist with substantial position bias.
 
 ## Stream profiles and USB
 
-The D435i prefers 1280×720@30, but a USB 2.0/2.1 port caps it much lower
-(observed: color 1280×720@15, depth 848×480@10). The camera starts the
-requested profile, then falls back through
-1280×720@15 + 640×480@15 → 640×480@30 → 848×480@10. For full frame rate use a
-USB 3.0 (blue) port.
+Capture binds the selected `--serial` on every startup/fallback attempt. Color-only
+capture is the default because depth is unused by the estimator. Use `--depth` to
+also enable the depth stream; no depth values are currently fused into pose.
 
-## Report fields
-
-- `expected_marker_ids`, `detected_marker_ids`, `matched_marker_ids`,
-  `missing_marker_ids`, `foreign_marker_ids`, `duplicate_marker_ids`
-- `detected_charuco_ids`, `detected_charuco_corner_count`,
-  `expected_charuco_corner_count`
-- `full_expected_visibility` — true only when every marker and every corner is
-  detected exactly once
-- `pose` (camera mode, `--pose`) — `rotation_matrix`, `rvec`, `tvec_m`,
-  `position_mm`; board origin at the outer top-left pattern corner, X right,
-  Y down, Z into the board (plane Z=0). `solvePnP` under the supplied
-  intrinsics; not a dimensional or metrology certification.
-- `source`, `frames_sampled`, `image_pixels`, `rejected_marker_candidate_count`,
-  `passed`
-
-## Pose accuracy
-
-`solvePnP` is as good as the corner detection and intrinsics. The RealSense
-color intrinsics are factory-calibrated for undistorted pinhole projection;
-lens distortion is ignored here, which is fine at moderate distance. Do not
-use `position_mm` for dimensional work without a separate calibration and
-uncertainty analysis.
+The camera first tries the requested profile (default 1280x720@30), then
+1280x720@15, 640x480@30, and 848x480@10. When depth is enabled, fallback depth
+profiles are respectively 640x480@15, 640x480@30, and 848x480@10. The actual profile
+is recorded. The tested USB 2.1 connection negotiates color 1280x720@15; USB 3.0
+provides more bandwidth. Frame-number gaps should be considered when comparing
+runs with different capture or image-saving settings.
 
 ## Tests
 
@@ -84,10 +315,13 @@ uncertainty analysis.
 .venv/bin/python -m pytest -q
 ```
 
-Tests render the configured boards from the sibling generator checkout and
-verify: full-board detection in the rendered PNG, blank-image rejection,
-foreign-board ID separation (rear markers are foreign to the front board), and
-pose recovery from a simulated perspective photo.
+Tests cover rendered-board recognition and foreign IDs; known-pose projection
+with lens distortion; iterative/IPPE/refined solvers; outlier rejection, coverage
+and residual quality gates; print-scale bias; corner-ID association and missing
+observations; rotation wraparound; analytic jitter/accuracy statistics; camera
+serial/fallback/error handling; exposure restoration; best-image selection;
+recording/reanalysis; and partial-recording finalization. Synthetic checks verify
+implementation behavior, not a hardware accuracy specification.
 
 ## Python API
 
@@ -95,17 +329,26 @@ pose recovery from a simulated perspective photo.
 import cv2
 from charuco_generator.board import reconstruct_board
 from charuco_generator.validation import load_manifest
-from charuco_realsense.camera import RealsenseCamera, StreamConfig
-from charuco_realsense.detect import detect_charuco
-from charuco_realsense.pose import estimate_pose
+from charuco_realsense import CharucoDetector, PoseOptions, estimate_pose
+from charuco_realsense.camera import RealsenseCamera
 
 manifest = load_manifest("../charuco-generator/output/board_manifest.json")
 board = reconstruct_board(manifest, "front")
 record = next(b for b in manifest["boards"] if b["name"] == "front")
+detector = CharucoDetector(board, record["geometry"]["border_bits"])
 
-with RealsenseCamera(config=StreamConfig(1280, 720, 15)) as camera:
+with RealsenseCamera() as camera:
     frame = camera.read()
     gray = cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY)
-    detection = detect_charuco(board, gray, record["geometry"]["border_bits"])
-    pose = estimate_pose(board, detection, frame.intrinsics)
+    detection = detector.detect(gray, frame.intrinsics)
+    pose = estimate_pose(board, detection, frame.intrinsics, PoseOptions())
+    if pose is not None:
+        print(pose["position_mm"], pose["quality_passed"], pose["reprojection_rmse_px"])
 ```
+
+The single-image `detect_charuco(board, gray, border_bits, intrinsics=None)` helper
+remains available. For sequences, reuse `CharucoDetector` as above.
+
+References: [OpenCV ChArUco detection](https://docs.opencv.org/4.11.0/df/d4a/tutorial_charuco_detection.html),
+[OpenCV pose solvers](https://docs.opencv.org/4.11.0/d5/d1f/calib3d_solvePnP.html),
+[RealSense projection and distortion models](https://dev.realsenseai.com/docs/projection-in-realsense-sdk-2-0/).

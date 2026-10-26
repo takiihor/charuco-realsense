@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Set up this checkout and run the RealSense detection CLI. No activation or global pip needed.
 #
-#   ./start_camera.sh                 # live stream view of the front board
-#   ./start_camera.sh --board rear    # live stream view of another board
+#   ./start_camera.sh                 # desktop UI for the front board
+#   ./start_camera.sh --board rear    # desktop UI for another board
+#   ./start_camera.sh stream --board front --pose  # simple OpenCV live view
 #   ./start_camera.sh detect --board front --frames 10 --pose
+#   ./start_camera.sh benchmark --board front --seconds 60 --output output/run-01
+#   ./start_camera.sh summarize --record output/run-01
 #   ./start_camera.sh list
 set -euo pipefail
 
@@ -99,10 +102,10 @@ elif ! "$VENV_PYTHON" -c 'import charuco_generator' >/dev/null 2>&1; then
 fi
 
 if [[ $# -eq 0 ]]; then
-    set -- stream --board front
+    set -- gui --board front
 elif [[ "$1" == -* && "$1" != "--help" && "$1" != "-h" ]]; then
     # Convenience: ./start_camera.sh --board rear
-    set -- stream "$@"
+    set -- gui "$@"
 fi
 
 exec "$VENV_PYTHON" "$PROJECT_DIR/main.py" "$@"

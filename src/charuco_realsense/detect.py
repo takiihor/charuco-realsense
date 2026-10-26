@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from .calibration import opencv_calibration
+
 
 class DetectionError(ValueError):
     pass
@@ -25,39 +27,58 @@ class Detection:
         return len(self.marker_ids) > 0
 
 
-def detect_charuco(board, image_gray: np.ndarray, border_bits: int = 1) -> Detection:
-    """Detect markers and internal corners using the modern OpenCV API.
+class CharucoDetector:
+    """Reusable detectors; one marker pass per frame, including blank frames."""
 
-    ``board`` is a cv2.aruco.CharucoBoard (e.g. from charuco_generator.reconstruct_board).
-    ``border_bits`` must match the board's configured marker border.
-    """
-    if image_gray.ndim != 2:
-        raise DetectionError("image_gray must be a single-channel image")
-    params = cv2.aruco.DetectorParameters()
-    params.markerBorderBits = border_bits
-    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
-    marker_corners, marker_ids, rejected = cv2.aruco.ArucoDetector(
-        board.getDictionary(), params).detectMarkers(image_gray)
-    charuco_params = cv2.aruco.CharucoParameters()
-    charuco_params.tryRefineMarkers = False
-    charuco_corners, charuco_ids, _, _ = cv2.aruco.CharucoDetector(
-        board, charuco_params, params).detectBoard(image_gray)
-    if marker_ids is None:
-        marker_ids = np.asarray([], dtype=np.int32)
-    if marker_corners is None:
-        marker_corners = np.zeros((0, 4, 2), dtype=np.float32)
-    if charuco_ids is None:
-        charuco_ids = np.asarray([], dtype=np.int32)
-    if charuco_corners is None:
-        charuco_corners = np.zeros((0, 1, 2), dtype=np.float32)
-    return Detection(
-        image_pixels=(image_gray.shape[1], image_gray.shape[0]),
-        marker_ids=tuple(int(v) for v in np.asarray(marker_ids).ravel()),
-        marker_corners=np.asarray(marker_corners, dtype=np.float32),
-        charuco_ids=tuple(int(v) for v in np.asarray(charuco_ids).ravel()),
-        charuco_corners=np.asarray(charuco_corners, dtype=np.float32),
-        rejected_candidates=len(rejected) if rejected is not None else 0,
-    )
+    def __init__(self, board, border_bits: int = 1):
+        if not isinstance(border_bits, int) or border_bits < 1:
+            raise DetectionError("border_bits must be a positive integer")
+        self.settings = {"border_bits": border_bits, "marker_corner_refinement": "none",
+                         "try_refine_markers": False}
+        params = cv2.aruco.DetectorParameters()
+        params.markerBorderBits = border_bits
+        # ChArUco chessboard corners are subpixel-refined by detectBoard itself.
+        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
+        self._markers = cv2.aruco.ArucoDetector(board.getDictionary(), params)
+        self._charuco = cv2.aruco.CharucoDetector(board, cv2.aruco.CharucoParameters(), params)
+        self._calibration_key = None
+
+    def detect(self, image_gray: np.ndarray, intrinsics: dict | None = None) -> Detection:
+        if image_gray.ndim != 2 or image_gray.dtype != np.uint8 or not image_gray.size:
+            raise DetectionError("image_gray must be a nonempty uint8 single-channel image")
+        size = (image_gray.shape[1], image_gray.shape[0])
+        matrix, coeffs = (None, None) if intrinsics is None else opencv_calibration(intrinsics, size)
+        key = () if matrix is None else (tuple(matrix.ravel()), tuple(coeffs))
+        if key != self._calibration_key:
+            params = cv2.aruco.CharucoParameters()
+            params.tryRefineMarkers = False
+            if matrix is not None:
+                params.cameraMatrix = matrix
+                params.distCoeffs = coeffs
+            self._charuco.setCharucoParameters(params)
+            self._calibration_key = key
+        marker_corners, marker_ids, rejected = self._markers.detectMarkers(image_gray)
+        charuco_corners, charuco_ids = None, None
+        # Empty marker inputs cause OpenCV to run marker detection again; skip that.
+        if marker_ids is not None and len(marker_ids):
+            charuco_corners, charuco_ids, _, _ = self._charuco.detectBoard(
+                image_gray, markerCorners=marker_corners, markerIds=marker_ids)
+        return Detection(
+            image_pixels=size,
+            marker_ids=tuple(int(v) for v in np.asarray(marker_ids).ravel()) if marker_ids is not None else (),
+            marker_corners=(np.asarray(marker_corners, dtype=np.float32).reshape(-1, 4, 2)
+                            if marker_corners is not None else np.empty((0, 4, 2), np.float32)),
+            charuco_ids=tuple(int(v) for v in np.asarray(charuco_ids).ravel()) if charuco_ids is not None else (),
+            charuco_corners=(np.asarray(charuco_corners, dtype=np.float32).reshape(-1, 1, 2)
+                             if charuco_corners is not None else np.empty((0, 1, 2), np.float32)),
+            rejected_candidates=len(rejected) if rejected is not None else 0,
+        )
+
+
+def detect_charuco(board, image_gray: np.ndarray, border_bits: int = 1,
+                   intrinsics: dict | None = None) -> Detection:
+    """Convenience API for one image; reuse CharucoDetector for sequences."""
+    return CharucoDetector(board, border_bits).detect(image_gray, intrinsics)
 
 
 def report_for_board(detection: Detection, expected_ids, expected_corner_count: int) -> dict:
@@ -75,6 +96,12 @@ def report_for_board(detection: Detection, expected_ids, expected_corner_count: 
         "duplicate_marker_ids": sorted({v for v in detected if detected.count(v) > 1}),
         "detected_charuco_ids": sorted(detection.charuco_ids),
         "detected_charuco_corner_count": len(detection.charuco_ids),
+        "duplicate_charuco_ids": sorted({v for v in detection.charuco_ids if detection.charuco_ids.count(v) > 1}),
+        # Explicit ID/coordinate pairs avoid losing association when IDs are sorted.
+        "charuco_corners": [{"id": int(i), "pixel": p.ravel().tolist()}
+                            for i, p in zip(detection.charuco_ids, detection.charuco_corners)],
+        "marker_corners": [{"id": int(i), "pixels": p.tolist()}
+                           for i, p in zip(detection.marker_ids, detection.marker_corners)],
         "rejected_marker_candidate_count": detection.rejected_candidates,
         "full_expected_visibility": (
             sorted(detected) == sorted(expected)
