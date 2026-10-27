@@ -1,4 +1,5 @@
 import csv
+import copy
 import json
 from pathlib import Path
 import time
@@ -107,6 +108,13 @@ def test_worker_records_all_frames_while_preview_drops_old_frames(worker_setup, 
     assert len(rows) == 8
     assert rows[2]["position_jitter_mm"] == ""
     assert rows[2]["pose_available"] == "False"
+    assert rows[2]["position_x_mm"] == "" and rows[2]["position_z_mm"] == ""
+    assert float(rows[0]["position_z_mm"]) == pytest.approx(frames[0]["pose"]["position_mm"][2])
+    with (directory / "markers.csv").open(newline="") as source:
+        marker_rows = list(csv.DictReader(source))
+    assert len(marker_rows) == sum(len(frame["marker_coordinates"]) for frame in frames)
+    assert all(row["position_z_mm"] for row in marker_rows)
+    assert json.loads((directory / "session.json").read_text())["coordinates"]["frame"] == "camera optical frame"
 
 
 def test_stop_recording_keeps_preview_running(worker_setup, tmp_path):
@@ -129,6 +137,7 @@ def test_stop_recording_keeps_preview_running(worker_setup, tmp_path):
 
 def test_camera_error_finalizes_ui_recording(worker_setup, tmp_path):
     worker, camera, _ = worker_setup
+    worker.args.reconnect = False
 
     def action(index):
         if index == 5:
@@ -141,6 +150,29 @@ def test_camera_error_finalizes_ui_recording(worker_setup, tmp_path):
     assert worker.last_summary["status"] == "error"
     assert worker.last_summary["frames_recorded"] == 4
     assert ("error", "unplugged") in events(worker)
+
+
+def test_interrupt_finalizes_partial_recording(worker_setup, tmp_path):
+    worker, camera, _ = worker_setup
+    camera.callback = lambda index: worker.disconnect(KeyboardInterrupt("SIGINT")) if index == 3 else None
+    worker.start_recording(tmp_path / "interrupted")
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive() and camera.closed
+    assert worker.last_summary["status"] == "interrupted"
+    assert worker.last_summary["frames_recorded"] == 3
+
+
+def test_disconnect_during_warmup_does_not_start_recording(worker_setup, tmp_path):
+    worker, camera, _ = worker_setup
+    worker.args.warmup_seconds = 10
+    camera.callback = lambda index: worker.disconnect() if index == 1 else None
+    worker.start_recording(tmp_path / "not-started")
+    worker.start()
+    worker.join(timeout=2)
+    assert not worker.is_alive() and camera.closed
+    assert camera.index == 1
+    assert not (tmp_path / "not-started").exists()
 
 
 def test_recording_error_does_not_overwrite_or_disconnect_preview(worker_setup, tmp_path):
@@ -186,6 +218,18 @@ def test_gui_recording_buttons_save_and_release_camera(worker_setup, tmp_path):
     try:
         app.connect_button.invoke()
         until(lambda: app.connected)
+        until(lambda: app.last_report is not None and app.last_report["pose"] is not None)
+        assert len(app.coordinate_table.get_children()) == len(app.last_report["marker_coordinates"])
+        assert float(app.metrics["z"].get()) == pytest.approx(app.last_report["pose"]["position_mm"][2], abs=.01)
+        app.copy_button.invoke()
+        assert "camera frame / mm" in root.clipboard_get()
+        assert "Quality passed:" in root.clipboard_get()
+        missing = copy.deepcopy(app.last_report)
+        missing.update(pose=None, pose_available=False, pose_quality_passed=False, board_recognized=False,
+                       marker_coordinates=[], matched_marker_ids=[], detected_charuco_corner_count=0)
+        app._show_preview({"report": missing, "image": app.last_image, "points": [], "recording": False})
+        assert app.metrics["z"].get() == "--" and app.copy_button.instate(["disabled"])
+        assert not app.coordinate_table.get_children()
         app.record_button.invoke()
         until(lambda: app.recording and worker.recorded_frames >= 4)
         app.stop_button.invoke()
@@ -204,3 +248,158 @@ def test_gui_recording_buttons_save_and_release_camera(worker_setup, tmp_path):
             root.destroy()
         except tk.TclError:
             pass
+
+
+def test_camera_loss_reconnects_and_resumes_recording_in_a_new_part(worker_setup, tmp_path):
+    worker, camera, _ = worker_setup
+    worker.args.reconnect_max_seconds = .05
+    worker.args.hardware_reset_after = 2
+    resets = []
+    worker.device_reset = lambda args: resets.append(args.serial) or True
+    opened = []
+    original = worker.camera_factory
+
+    def factory(args):
+        opened.append(len(opened))
+        if len(opened) in (2, 3):
+            raise CameraError("No RealSense device found")  # Unplugged while recording.
+        return original(args)
+    worker.camera_factory = factory
+
+    def action(index):
+        if index == 5:
+            raise CameraError("USB disconnected")
+        if index == 9:
+            worker.disconnect()
+    camera.callback = action
+    base = tmp_path / "series"
+    worker.start_recording(base)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive() and camera.closed
+    values = events(worker)
+    kinds = [kind for kind, _ in values]
+    lost = [payload for kind, payload in values if kind == "camera_lost"]
+    assert [p["attempt"] for p in lost] == [1, 2, 3] and lost[0]["recording"]
+    assert resets == [None]  # After the second consecutive failed attempt.
+    assert kinds.count("ready") == 2 and kinds[-1] == "disconnected"
+    started = [payload for kind, payload in values if kind == "record_started"]
+    assert [(p["part"], p["reason"]) for p in started] == [(1, "start"), (2, "reconnect")]
+    stopped = [payload for kind, payload in values if kind == "record_stopped"]
+    assert [(p["final"], p["summary"]["status"]) for p in stopped] == [(False, "error"), (True, "complete")]
+    second = tmp_path / "series-part0002"
+    assert json.loads((second / "session.json").read_text())["segment"] == {
+        "series": "series", "part": 2, "reason": "reconnect", "segment_minutes": 60.}
+    first_frames = (base / "frames.jsonl").read_text().splitlines()
+    second_frames = [json.loads(line) for line in (second / "frames.jsonl").read_text().splitlines()]
+    assert len(first_frames) == 4 and len(second_frames) == 4
+    assert second_frames[0]["frame_index"] == 0
+    # Elapsed time continues across parts of one series.
+    assert second_frames[0]["elapsed_ms"] > json.loads(first_frames[-1])["elapsed_ms"]
+    assert worker.recorded_frames == 8
+    assert worker.health["camera_losses"] == 1 and worker.health["reconnects"] == 1
+
+
+def test_recording_rotates_into_parts(worker_setup, tmp_path):
+    worker, camera, _ = worker_setup
+    worker.args.segment_minutes = .05 / 60  # 50 ms parts; camera frames are 10 ms apart.
+    camera.callback = lambda index: worker.disconnect() if index == 30 else None
+    worker.start_recording(tmp_path / "rotating")
+    worker.start()
+    worker.join(timeout=5)
+    parts = sorted(tmp_path.glob("rotating*"))
+    assert len(parts) >= 3, events(worker)
+    total = 0
+    for part in parts:
+        summary = json.loads((part / "summary.json").read_text())
+        assert summary["status"] == "complete"
+        total += summary["frames_recorded"]
+        with (part / "jitter.csv").open(newline="") as source:
+            assert len(list(csv.DictReader(source))) == summary["frames_recorded"]
+    assert total == worker.recorded_frames == 30
+    reasons = [payload["reason"] for kind, payload in events(worker) if kind == "record_started"]
+    assert reasons[0] == "start" and set(reasons[1:]) == {"rotation"}
+
+
+def test_low_disk_space_stops_recording_but_keeps_preview(worker_setup, tmp_path, monkeypatch):
+    from charuco_realsense import monitor
+    worker, camera, _ = worker_setup
+    free = [10e9]
+    monkeypatch.setattr(monitor, "_free_bytes", lambda path: free[0])
+
+    def action(index):
+        if index == 3:
+            free[0] = 1e9
+            worker._next_disk_check = 0.
+        if index == 6:
+            worker.disconnect()
+    camera.callback = action
+    worker.start_recording(tmp_path / "disk")
+    worker.start()
+    worker.join(timeout=5)
+    values = events(worker)
+    assert any(kind == "record_error" and "Low disk space" in payload for kind, payload in values)
+    assert worker.last_summary["status"] == "error" and worker.last_summary["frames_recorded"] == 3
+    assert camera.index == 6 and worker.request is None
+
+
+def test_storage_error_stops_recording_but_keeps_preview(worker_setup, tmp_path):
+    worker, camera, _ = worker_setup
+
+    def action(index):
+        if index == 3:
+            worker.recorder._file.close()  # Next write fails like a lost disk.
+        if index == 6:
+            worker.disconnect()
+    camera.callback = action
+    worker.start_recording(tmp_path / "storage")
+    worker.start()
+    worker.join(timeout=5)
+    assert camera.index == 6
+    assert any(kind == "record_error" for kind, _ in events(worker))
+    assert worker.recorder is None and worker.request is None
+
+
+def test_frame_processing_error_is_skipped(worker_setup, tmp_path, monkeypatch):
+    from charuco_realsense import monitor
+    worker, camera, _ = worker_setup
+    original = monitor._analyze
+    calls = []
+
+    def flaky(*args):
+        calls.append(1)
+        if len(calls) == 2:
+            raise cv2.error("corrupt frame")
+        return original(*args)
+    monkeypatch.setattr(monitor, "_analyze", flaky)
+    camera.callback = lambda index: worker.disconnect() if index == 5 else None
+    worker.start_recording(tmp_path / "skip")
+    worker.start()
+    worker.join(timeout=5)
+    assert worker.last_summary["frames_recorded"] == 4
+    assert worker.health["processing_errors"] == 1
+    assert any(kind == "warning" for kind, _ in events(worker))
+
+
+def test_stop_while_camera_unavailable_ends_series(worker_setup, tmp_path):
+    worker, camera, _ = worker_setup
+    worker.args.reconnect_max_seconds = 5.
+    worker.args.hardware_reset_after = 0
+
+    def factory(args):
+        worker.stop_recording()
+        raise CameraError("No RealSense device found")
+    worker.camera_factory = factory
+    worker.start_recording(tmp_path / "never")
+    worker.start()
+    values = []
+    deadline = time.monotonic() + 2
+    while not any(kind == "record_stopped" for kind, _ in values) and time.monotonic() < deadline:
+        values.append(worker.events.get(timeout=2))
+    worker.disconnect()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    values += events(worker)
+    assert [kind for kind, _ in values] == ["camera_lost", "record_stopped", "disconnected"]
+    assert ("record_stopped", {"path": None, "summary": None, "part": 0, "reason": "stopped", "final": True}) in values
+    assert not (tmp_path / "never").exists()

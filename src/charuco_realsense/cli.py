@@ -1,5 +1,6 @@
 """Detect boards, display a live stream, and record repeatability experiments."""
 import argparse
+from collections import Counter
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -56,7 +57,8 @@ def _analyze(board, record, detector, image, intrinsics, include_pose, options):
             pose = estimate_pose(board, detection, intrinsics, options)
         except PoseInputError:
             pose_failure = "invalid_corner_correspondences"
-    if pose and any(detection.marker_ids.count(i) > 1 for i in record["marker_ids"]):
+    marker_counts = Counter(detection.marker_ids)
+    if pose and any(marker_counts[i] > 1 for i in record["marker_ids"]):
         pose["quality_passed"] = False
         pose["quality_reasons"].append("duplicate_expected_marker_ids")
     recognized = bool(set(detection.marker_ids) & set(record["marker_ids"]))
@@ -83,7 +85,7 @@ def _detect_image(board, record, image_bgr, border_bits, include_pose, intrinsic
                     intrinsics, include_pose, PoseOptions())[1]
 
 
-def _draw(overlay: np.ndarray, detection: Detection) -> np.ndarray:
+def _draw(overlay: np.ndarray, detection: Detection, pose=None, intrinsics=None) -> np.ndarray:
     for corner, marker_id in zip(detection.marker_corners, detection.marker_ids):
         pts = np.asarray(corner).reshape(4, 2).astype(int)
         cv2.polylines(overlay, [pts], True, (0, 0, 255), 2)
@@ -94,22 +96,36 @@ def _draw(overlay: np.ndarray, detection: Detection) -> np.ndarray:
         cv2.circle(overlay, (x, y), 3, (0, 255, 0), -1)
         cv2.putText(overlay, str(charuco_id), (x + 5, y - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+    if pose is not None and intrinsics is not None and pose["positive_depth"]:
+        matrix, coeffs = opencv_calibration(intrinsics, detection.image_pixels)
+        cv2.drawFrameAxes(overlay, matrix, coeffs, np.asarray(pose["rvec"]),
+                          np.asarray(pose["tvec_m"]), .03, 2)
     return overlay
 
 
-def _open_camera(args):
+def _open_camera(args, stop_event=None):
     return RealsenseCamera(serial=args.serial,
-                           config=StreamConfig(args.width, args.height, args.fps, args.depth))
+                           config=StreamConfig(args.width, args.height, args.fps, args.depth),
+                           stop_event=stop_event)
 
 
-def _settle_camera(camera, args):
+def _settle_camera(camera, args, stop_event=None, progress=None):
+    """Discard warmup frames; progress() runs after each read (worker heartbeat)."""
     deadline = time.monotonic() + args.warmup_seconds
     while time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return
         camera.read()
+        if progress is not None:
+            progress()
     if args.lock_exposure:
+        if stop_event is not None and stop_event.is_set():
+            return
         camera.lock_exposure()
         # Discard a few queued frames captured before the option took effect.
         for _ in range(3):
+            if stop_event is not None and stop_event.is_set():
+                return
             camera.read()
 
 
@@ -269,6 +285,16 @@ def _finite_float(value):
         raise argparse.ArgumentTypeError("must be finite") from exc
 
 
+def _nonnegative_int(value):
+    try:
+        number = int(value)
+        if number < 0:
+            raise ValueError
+        return number
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer") from exc
+
+
 def _positive_float(value):
     number = _finite_float(value)
     if number <= 0:
@@ -324,13 +350,34 @@ def parser() -> argparse.ArgumentParser:
     detect.add_argument("--report", default=None)
     detect.add_argument("--save-image", default=None)
 
-    gui = commands.add_parser("gui", parents=[common], help="Desktop camera monitor with jitter charts and recording controls")
-    gui.add_argument("--output-dir", default="output", help="Parent directory for UI recordings")
-    gui.add_argument("--save-frames", action="store_true", help="Initially enable saving raw PNG frames")
-    gui.add_argument("--reference-pose", help="Independent static reference pose JSON")
-    gui.add_argument("--rolling-seconds", type=_positive_float, default=2., help="Live jitter calculation window (default: 2 s)")
-    gui.add_argument("--window-seconds", type=_positive_float, default=30., help="Chart history (default: 30 s)")
-    gui.set_defaults(frames=None, seconds=None)
+    monitor = argparse.ArgumentParser(add_help=False)
+    monitor.add_argument("--output-dir", default="output", help="Parent directory for recordings and logs")
+    monitor.add_argument("--save-frames", action="store_true", help="Save raw PNG frames (about 1.5 MB each)")
+    monitor.add_argument("--reference-pose", help="Independent static reference pose JSON")
+    monitor.add_argument("--rolling-seconds", type=_positive_float, default=2., help="Live jitter calculation window (default: 2 s)")
+    monitor.add_argument("--window-seconds", type=_positive_float, default=30., help="Chart history (default: 30 s)")
+    monitor.add_argument("--segment-minutes", type=_nonnegative_float, default=60.,
+                         help="Start a new recording part after this many minutes; 0 disables (default: 60)")
+    monitor.add_argument("--min-free-gb", type=_nonnegative_float, default=2.,
+                         help="Stop recording when free disk space falls below this (default: 2 GB)")
+    monitor.add_argument("--no-reconnect", dest="reconnect", action="store_false",
+                         help="Stop instead of reconnecting after a camera failure")
+    monitor.add_argument("--reconnect-max-seconds", type=_positive_float, default=30.,
+                         help="Longest wait between reconnection attempts (default: 30 s)")
+    monitor.add_argument("--hardware-reset-after", type=_nonnegative_int, default=3,
+                         help="Hardware-reset the camera after every N failed reconnects; 0 disables (default: 3)")
+    monitor.add_argument("--stall-seconds", type=_positive_float, default=30.,
+                         help="Report the capture thread as stalled, and stop systemd watchdog pings, after this long (default: 30 s)")
+    monitor.add_argument("--log-file", default=None,
+                         help="Rotating log file (default: OUTPUT_DIR/logs/charuco-realsense.log; empty string disables)")
+    monitor.set_defaults(frames=None, seconds=None)
+
+    gui = commands.add_parser("gui", parents=[common, monitor], help="Desktop camera monitor with jitter charts and recording controls")
+    gui.add_argument("--auto-record", action="store_true", help="Start recording as soon as the camera is ready")
+
+    service = commands.add_parser("service", parents=[common, monitor],
+                                  help="Headless 24/7 recorder: reconnects, rotates parts, logs, systemd watchdog")
+    service.add_argument("--no-record", action="store_true", help="Monitor and log camera health without recording")
 
     for name in ("stream", "benchmark"):
         capture = commands.add_parser(name, parents=[common], help="Live GUI" if name == "stream" else "Record raw measurements and jitter statistics")
@@ -370,6 +417,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "gui":
             from .gui import run_gui
             return run_gui(args)
+        if args.command == "service":
+            from .service import run_service
+            return run_service(args)
         return _cmd_capture(args)
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)

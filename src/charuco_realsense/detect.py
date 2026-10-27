@@ -1,4 +1,5 @@
 """ChArUco detection from grayscale images, mirroring charuco-generator's validation."""
+from collections import Counter
 from dataclasses import dataclass
 
 import cv2
@@ -85,6 +86,8 @@ def report_for_board(detection: Detection, expected_ids, expected_corner_count: 
     """Split detected IDs into matched / missing / foreign for a known board."""
     expected = list(expected_ids)
     detected = detection.marker_ids
+    marker_counts = Counter(detected)
+    corner_counts = Counter(detection.charuco_ids)
     return {
         "expected_marker_ids": expected,
         "expected_charuco_corner_count": expected_corner_count,
@@ -93,10 +96,10 @@ def report_for_board(detection: Detection, expected_ids, expected_corner_count: 
         "matched_marker_ids": sorted(set(detected) & set(expected)),
         "missing_marker_ids": sorted(set(expected) - set(detected)),
         "foreign_marker_ids": sorted(set(detected) - set(expected)),
-        "duplicate_marker_ids": sorted({v for v in detected if detected.count(v) > 1}),
+        "duplicate_marker_ids": sorted(i for i, count in marker_counts.items() if count > 1),
         "detected_charuco_ids": sorted(detection.charuco_ids),
         "detected_charuco_corner_count": len(detection.charuco_ids),
-        "duplicate_charuco_ids": sorted({v for v in detection.charuco_ids if detection.charuco_ids.count(v) > 1}),
+        "duplicate_charuco_ids": sorted(i for i, count in corner_counts.items() if count > 1),
         # Explicit ID/coordinate pairs avoid losing association when IDs are sorted.
         "charuco_corners": [{"id": int(i), "pixel": p.ravel().tolist()}
                             for i, p in zip(detection.charuco_ids, detection.charuco_corners)],

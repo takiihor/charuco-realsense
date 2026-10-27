@@ -1,0 +1,34 @@
+# Headless 24/7 recorder as a systemd *user* service. Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/charuco-realsense.service ~/.config/systemd/user/
+#   # Edit the checkout path, --board and --output-dir below if they differ.
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now charuco-realsense
+#   sudo loginctl enable-linger "$USER"   # start at boot, keep running after logout
+#   journalctl --user -u charuco-realsense -f
+[Unit]
+Description=ChArUco RealSense 24/7 recorder
+# Never give up restarting; each failure is still logged.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+WorkingDirectory=%h/development/charuco-realsense
+ExecStart=%h/development/charuco-realsense/start_camera.sh service --board front --output-dir %h/development/charuco-realsense/output/24x7
+Restart=always
+RestartSec=10
+# Pings stop when the capture thread makes no progress for --stall-seconds
+# (default 30 s), e.g. when the USB stack hangs; systemd then restarts the
+# service. Recordings are finalized line by line, so a restart loses at most
+# the summary of the interrupted part (rebuild it with `summarize`).
+WatchdogSec=90
+# The first start may create the virtual environment.
+TimeoutStartSec=600
+# SIGTERM saves the active part; allow time for its summary before SIGKILL.
+TimeoutStopSec=60
+SuccessExitStatus=130 143
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
