@@ -85,17 +85,20 @@ def _detect_image(board, record, image_bgr, border_bits, include_pose, intrinsic
                     intrinsics, include_pose, PoseOptions())[1]
 
 
-def _draw(overlay: np.ndarray, detection: Detection, pose=None, intrinsics=None) -> np.ndarray:
+def _draw(overlay: np.ndarray, detection: Detection, pose=None, intrinsics=None, labels=True) -> np.ndarray:
+    """Marker outlines, corners and pose axes; labels=False leaves ID text to the caller."""
     for corner, marker_id in zip(detection.marker_corners, detection.marker_ids):
         pts = np.asarray(corner).reshape(4, 2).astype(int)
         cv2.polylines(overlay, [pts], True, (0, 0, 255), 2)
-        cv2.putText(overlay, str(marker_id), (int(pts[0][0]), int(pts[0][1]) - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        if labels:
+            cv2.putText(overlay, str(marker_id), (int(pts[0][0]), int(pts[0][1]) - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
     for corner, charuco_id in zip(detection.charuco_corners, detection.charuco_ids):
         x, y = (int(round(float(v))) for v in corner.ravel())
         cv2.circle(overlay, (x, y), 3, (0, 255, 0), -1)
-        cv2.putText(overlay, str(charuco_id), (x + 5, y - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        if labels:
+            cv2.putText(overlay, str(charuco_id), (x + 5, y - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
     if pose is not None and intrinsics is not None and pose["positive_depth"]:
         matrix, coeffs = opencv_calibration(intrinsics, detection.image_pixels)
         cv2.drawFrameAxes(overlay, matrix, coeffs, np.asarray(pose["rvec"]),

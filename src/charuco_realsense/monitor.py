@@ -431,7 +431,7 @@ class CaptureWorker(threading.Thread):
                     self._abort_recording(exc)
             # Redraw charts/preview at up to 10 Hz without throttling recording.
             if now - self._last_publish >= .1:
-                preview = {"image": _draw(frame.bgr.copy(), detection, report["pose"], intrinsics), "report": report,
+                preview = {"image": _draw(frame.bgr.copy(), detection, report["pose"], intrinsics, labels=False), "report": report,
                            "points": list(self.history.points), "recorded_frames": self.recorded_frames,
                            "recording": self.recorder is not None,
                            "recording_seconds": now - self.started_at if self.recorder else 0.}
