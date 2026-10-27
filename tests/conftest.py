@@ -5,7 +5,8 @@ import cv2
 import pytest
 import numpy as np
 
-from charuco_generator.board import canonical_hash, create_board, layout_record
+from charuco_generator import __version__ as generator_version
+from charuco_generator.board import canonical_hash, create_board, layout_record, sha256
 from charuco_generator.config import load_config
 from charuco_generator.render import render_png
 
@@ -23,16 +24,21 @@ def artifacts(tmp_path_factory):
     directory = tmp_path_factory.mktemp("boards")
     manifest = {
         "schema_version": 1,
+        "generator_version": generator_version,
         "environment": {"opencv": cv2.__version__},
         "configuration": config.to_dict(),
         "configuration_sha256": canonical_hash(config.to_dict()),
         "boards": [],
+        "combined_pdf": None,
+        "pdf_layouts": {},
+        "sha256": {},
     }
     for spec in config.boards:
         board = create_board(config.geometry, spec)
         record = layout_record(config.geometry, spec, board)
         render_png(directory / f"{spec.name}_charuco.png", config.geometry, config.printing, board)
         record["files"] = {"png": f"{spec.name}_charuco.png"}
+        manifest["sha256"][record["files"]["png"]] = sha256(directory / record["files"]["png"])
         manifest["boards"].append(record)
     path = directory / "board_manifest.json"
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")

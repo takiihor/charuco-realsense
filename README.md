@@ -499,6 +499,15 @@ with RealsenseCamera() as camera:
 The single-image `detect_charuco(board, gray, border_bits, intrinsics=None)` helper
 remains available. For sequences, reuse `CharucoDetector` as above.
 
+The detector re-refines ChArUco chessboard intersections on the original image to correct the
+approximately +0.5 px offset in OpenCV 4.11's `detectBoard` output
+([OpenCV issue #25539](https://github.com/opencv/opencv/issues/25539)). Marker corners are unchanged.
+The window scales with corner spacing and frames with a refinement displacement over one pixel
+lose their ChArUco corners, so they cannot produce a pose from that suspect refinement. This
+applies to still-image detection, streaming, the monitor and headless service. Session metadata
+records `charuco_corner_refinement: true`. Use `CharucoDetector(board, refine=False)` only for
+diagnostics or when the caller performs its own image-based refinement.
+
 References: [OpenCV ChArUco detection](https://docs.opencv.org/4.11.0/df/d4a/tutorial_charuco_detection.html),
 [OpenCV pose solvers](https://docs.opencv.org/4.11.0/d5/d1f/calib3d_solvePnP.html),
 [RealSense projection and distortion models](https://dev.realsenseai.com/docs/projection-in-realsense-sdk-2-0/).

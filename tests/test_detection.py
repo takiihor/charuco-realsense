@@ -1,7 +1,53 @@
 import cv2
+import numpy as np
+import pytest
 
 from charuco_generator.board import reconstruct_board
-from charuco_realsense.detect import Detection, detect_charuco, report_for_board
+from charuco_realsense.detect import CharucoDetector, Detection, detect_charuco, refine_corners, report_for_board
+
+
+@pytest.mark.parametrize('calibrated', [False, True])
+def test_charuco_pixel_centres_are_unbiased(calibrated):
+    """Exact axis-aligned raster: each intersection lies between two pixel centres.
+
+    Test absolute geometry rather than expecting a particular OpenCV bug, so the
+    regression also passes when OpenCV fixes its internal coordinate convention.
+    """
+    board = cv2.aruco.CharucoBoard((5, 7), 0.03, 0.0225,
+                                  cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250))
+    image = np.pad(board.generateImage((600, 840)), 40, constant_values=255)
+    intrinsics = ({'width': 680, 'height': 920, 'fx': 1000., 'fy': 1000.,
+                   'ppx': 340., 'ppy': 460., 'model': 'none'} if calibrated else None)
+    detection = CharucoDetector(board).detect(image, intrinsics)
+    assert len(detection.charuco_ids) == 24
+    expected = np.asarray(board.getChessboardCorners())[:, :2] * 4000 + 39.5
+    errors = detection.charuco_corners.reshape(-1, 2) - expected[list(detection.charuco_ids)]
+    assert np.abs(errors).max() < 0.02
+    if calibrated:
+        from charuco_realsense.pose import estimate_pose
+        pose = estimate_pose(board, detection, intrinsics)
+        np.testing.assert_allclose(pose['tvec_m'], [-0.075125, -0.105125, 0.25], atol=1e-6)
+    # Applying the image-based correction again does not subtract another 0.5 px.
+    repeated = refine_corners(image, detection.charuco_corners)
+    np.testing.assert_allclose(repeated, detection.charuco_corners.reshape(-1, 2), atol=1e-3)
+
+
+def test_refinement_rejects_large_displacement(monkeypatch):
+    points = np.array([[20., 20.], [40., 20.], [20., 40.], [40., 40.]], np.float32)
+    monkeypatch.setattr(cv2, 'cornerSubPix', lambda image, corners, *args: corners + 2)
+    assert refine_corners(np.zeros((60, 60), np.uint8), points) is None
+
+
+def test_detector_discards_corners_when_refinement_fails(artifacts, monkeypatch):
+    directory, manifest = artifacts
+    record = manifest['boards'][0]
+    board = reconstruct_board(manifest, record['name'])
+    image = cv2.imread(str(directory / record['files']['png']), cv2.IMREAD_GRAYSCALE)
+    monkeypatch.setattr('charuco_realsense.detect.refine_corners', lambda *args: None)
+    detection = CharucoDetector(board).detect(image)
+    assert detection.found
+    assert detection.charuco_ids == ()
+    assert detection.charuco_corners.shape == (0, 1, 2)
 
 
 def test_detect_generated_png(artifacts):
