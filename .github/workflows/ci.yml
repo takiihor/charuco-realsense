@@ -29,6 +29,7 @@ jobs:
           trap 'rm -rf "$venv_dir"' EXIT
           python3 -m venv "$venv_dir"
           "$venv_dir/bin/python" -m pip install -e '.[test]'
-          "$venv_dir/bin/python" -m pip install --no-deps -e ../charuco-generator
           "$venv_dir/bin/python" -m pip check
+          # The generator declares headless OpenCV, but this project uses the GUI build.
+          "$venv_dir/bin/python" -m pip install --no-deps -e ../charuco-generator
           "$venv_dir/bin/python" -m pytest -q
