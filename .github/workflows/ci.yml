@@ -16,11 +16,19 @@ jobs:
     runs-on: [self-hosted, linux, x64, charuco-realsense]
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: charuco-realsense
+      - uses: actions/checkout@v4
+        with:
+          repository: takiihor/charuco-generator
+          path: charuco-generator
       - name: Install and test in an isolated environment
+        working-directory: charuco-realsense
         run: |
           venv_dir="$(mktemp -d "$RUNNER_TEMP/charuco-realsense-venv.XXXXXX")"
           trap 'rm -rf "$venv_dir"' EXIT
           python3 -m venv "$venv_dir"
           "$venv_dir/bin/python" -m pip install -e '.[test]'
+          "$venv_dir/bin/python" -m pip install --no-deps -e ../charuco-generator
           "$venv_dir/bin/python" -m pip check
           "$venv_dir/bin/python" -m pytest -q
