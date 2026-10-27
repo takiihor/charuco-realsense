@@ -1,6 +1,7 @@
 """ChArUco detection from grayscale images, mirroring charuco-generator's validation."""
 from collections import Counter
 from dataclasses import dataclass
+import math
 
 import cv2
 import numpy as np
@@ -28,17 +29,39 @@ class Detection:
         return len(self.marker_ids) > 0
 
 
+def refine_corners(image_gray: np.ndarray, pixels: np.ndarray) -> np.ndarray | None:
+    """Refine chessboard intersections in OpenCV's pixel-centre coordinates.
+
+    OpenCV 4.11's detectBoard adds (0.5, 0.5) after its internal cornerSubPix
+    pass (opencv/opencv#25539). Re-refining on the original image removes this
+    bias without a version-dependent subtraction. Reject a result that moves
+    any corner more than one pixel instead of accepting an unrelated feature.
+    The returned array is (N, 2); None means the frame cannot be refined.
+    """
+    points = np.asarray(pixels, np.float32).reshape(-1, 1, 2)
+    if len(points) < 2 or not np.isfinite(points).all():
+        return None
+    spacing = math.sqrt(max(cv2.contourArea(cv2.convexHull(points)), 1.0) / len(points))
+    half = int(min(8, max(2, spacing * 0.25)))
+    refined = cv2.cornerSubPix(image_gray, points.copy(), (half, half), (-1, -1),
+                               (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-4))
+    if not np.isfinite(refined).all() or np.max(np.linalg.norm((refined - points).reshape(-1, 2), axis=1)) > 1.0:
+        return None
+    return refined.reshape(-1, 2)
+
+
 class CharucoDetector:
     """Reusable detectors; one marker pass per frame, including blank frames."""
 
-    def __init__(self, board, border_bits: int = 1):
+    def __init__(self, board, border_bits: int = 1, *, refine: bool = True):
         if not isinstance(border_bits, int) or border_bits < 1:
             raise DetectionError("border_bits must be a positive integer")
         self.settings = {"border_bits": border_bits, "marker_corner_refinement": "none",
-                         "try_refine_markers": False}
+                         "try_refine_markers": False, "charuco_corner_refinement": refine}
+        self._refine = refine
         params = cv2.aruco.DetectorParameters()
         params.markerBorderBits = border_bits
-        # ChArUco chessboard corners are subpixel-refined by detectBoard itself.
+        # Keep marker refinement off; refine only chessboard intersections below.
         params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
         self._markers = cv2.aruco.ArucoDetector(board.getDictionary(), params)
         self._charuco = cv2.aruco.CharucoDetector(board, cv2.aruco.CharucoParameters(), params)
@@ -64,6 +87,12 @@ class CharucoDetector:
         if marker_ids is not None and len(marker_ids):
             charuco_corners, charuco_ids, _, _ = self._charuco.detectBoard(
                 image_gray, markerCorners=marker_corners, markerIds=marker_ids)
+            if self._refine and charuco_corners is not None and len(charuco_corners):
+                refined = refine_corners(image_gray, charuco_corners)
+                if refined is None:
+                    charuco_corners, charuco_ids = None, None
+                else:
+                    charuco_corners = refined.reshape(-1, 1, 2)
         return Detection(
             image_pixels=size,
             marker_ids=tuple(int(v) for v in np.asarray(marker_ids).ravel()) if marker_ids is not None else (),

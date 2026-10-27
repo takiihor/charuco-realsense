@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Fork code must not run on this machine's persistent self-hosted runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, charuco-realsense]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: charuco-realsense
+      - uses: actions/checkout@v4
+        with:
+          repository: takiihor/charuco-generator
+          path: charuco-generator
+      - name: Install and test in an isolated environment
+        working-directory: charuco-realsense
+        run: |
+          venv_dir="$(mktemp -d "$RUNNER_TEMP/charuco-realsense-venv.XXXXXX")"
+          trap 'rm -rf "$venv_dir"' EXIT
+          python3 -m venv "$venv_dir"
+          "$venv_dir/bin/python" -m pip install -e '.[test]'
+          "$venv_dir/bin/python" -m pip check
+          # The generator declares headless OpenCV, but this project uses the GUI build.
+          "$venv_dir/bin/python" -m pip install --no-deps -e ../charuco-generator
+          "$venv_dir/bin/python" -m pytest -q

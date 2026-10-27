@@ -135,11 +135,11 @@ class RealsenseCamera:
                 return
             raise CameraError(f"No stream profile resolved (last error: {last_error}); "
                               "try USB 3.0, a lower profile, or disabling --depth")
-        except RuntimeError as exc:
+        except BaseException as exc:
             self.close()
-            if isinstance(exc, CameraError):
-                raise
-            raise CameraError(f"Cannot start RealSense camera: {exc}") from exc
+            if isinstance(exc, RuntimeError) and not isinstance(exc, CameraError):
+                raise CameraError(f"Cannot start RealSense camera: {exc}") from exc
+            raise
 
     def _check_cancelled(self):
         if self._stop_event is not None and self._stop_event.is_set():

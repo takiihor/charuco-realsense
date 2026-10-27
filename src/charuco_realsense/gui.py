@@ -18,7 +18,7 @@ from .shutdown import SignalStop
 
 BG = "#f2f5f7"
 INK = "#172f3c"
-MUTED = "#617582"
+MUTED = "#465a67"  # Darker secondary text: core X fonts render without anti-aliasing.
 BLUE = "#2864d7"
 GREEN = "#087f72"
 RED = "#be3b44"
@@ -94,11 +94,102 @@ def _report_exception(kind, value, traceback):
     log.error("UI callback failed", exc_info=(kind, value, traceback))
 
 
+LABEL_FONT_FILES = ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                    "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf", "DejaVuSans-Bold.ttf", "Arial Bold.ttf")
+LABEL_AXIS_COLORS = ((255, 120, 120), (90, 220, 160), (120, 170, 255))
+_label_fonts = {}
+
+
+def _label_font(size):
+    """TrueType via Pillow: anti-aliased even when Tk itself only has core X fonts."""
+    if size not in _label_fonts:
+        from PIL import ImageFont
+        for path in LABEL_FONT_FILES:
+            try:
+                _label_fonts[size] = ImageFont.truetype(path, size)
+                break
+            except OSError:
+                continue
+        else:
+            _label_fonts[size] = ImageFont.load_default(size)
+    return _label_fonts[size]
+
+
+def _overlaps(box, boxes):
+    return any(box[0] < b[2] and b[0] < box[2] and box[1] < b[3] and b[1] < box[3] for b in boxes)
+
+
+def annotate_markers(image, markers, scale, selected=None, quality_passed=True):
+    """Label each marker with its ID and camera-frame X/Y/Z in mm, at display resolution.
+
+    Labels avoid each other and the other marker centres; one that cannot be
+    placed shrinks to its ID. The selected marker is placed first and highlighted.
+    Returns a new RGB image.
+    """
+    from PIL import Image, ImageDraw
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    title_font, body_font = _label_font(15), _label_font(13)
+    centres = {id(m): (m["pixel_center"][0] * scale, m["pixel_center"][1] * scale) for m in markers}
+    obstacles = [(x - 6, y - 6, x + 6, y + 6) for x, y in centres.values()]
+    placed = []
+    width, height = image.size
+    for marker in sorted(markers, key=lambda m: (m["id"] != selected, m["id"])):
+        cx, cy = centres[id(marker)]
+        chosen = marker["id"] == selected
+        position = marker["position_mm"]
+        title = f"#{marker['id']}" + ("" if marker["matched"] else "  other board") + (
+            "  duplicate" if marker["duplicate"] else "")
+        lines = [(f"{axis}  {value:+.1f}", color) for axis, value, color in
+                 zip("XYZ", position, LABEL_AXIS_COLORS)] if position else []
+        title_w = draw.textlength(title, font=title_font)
+        body_w = max((draw.textlength(text, font=body_font) for text, _ in lines), default=0)
+        box_w, box_h = int(max(title_w, body_w)) + 14, 22 + 17 * len(lines) + 4
+        box = None
+        own = (cx - 6, cy - 6, cx + 6, cy + 6)
+        others = [b for b in obstacles if b != own]
+        for dx, dy in ((14, -box_h / 2), (-14 - box_w, -box_h / 2), (-box_w / 2, -14 - box_h), (-box_w / 2, 14)):
+            x0 = min(max(2, cx + dx), width - box_w - 2)
+            y0 = min(max(2, cy + dy), height - box_h - 2)
+            candidate = (x0, y0, x0 + box_w, y0 + box_h)
+            if not _overlaps(candidate, placed + others):
+                box = candidate
+                break
+        if box is None and chosen:
+            x0 = min(max(2, cx + 14), width - box_w - 2)
+            y0 = min(max(2, cy - box_h / 2), height - box_h - 2)
+            box = (x0, y0, x0 + box_w, y0 + box_h)
+        outline = (255, 204, 0, 255) if chosen else (232, 160, 60, 255) if position and not quality_passed else (255, 255, 255, 90)
+        if box is None:
+            # No room for coordinates: a compact ID tag keeps every marker identifiable.
+            text = f"#{marker['id']}"
+            tw = draw.textlength(text, font=body_font)
+            tag = (cx - tw / 2 - 5, cy - 9, cx + tw / 2 + 5, cy + 9)
+            draw.rounded_rectangle(tag, 4, fill=(16, 39, 52, 200))
+            draw.text((cx, cy), text, font=body_font, fill=(255, 255, 255, 255), anchor="mm")
+            continue
+        placed.append(box)
+        edge_x = min(max(cx, box[0]), box[2])
+        edge_y = min(max(cy, box[1]), box[3])
+        if (edge_x, edge_y) != (cx, cy) and not (box[0] <= cx <= box[2] and box[1] <= cy <= box[3]):
+            draw.line((cx, cy, edge_x, edge_y), fill=outline[:3] + (230,), width=2)
+        draw.rounded_rectangle(box, 6, fill=(16, 39, 52, 228), outline=outline, width=3 if chosen else 1)
+        draw.text((box[0] + 7, box[1] + 4), title, font=title_font, fill=(255, 255, 255, 255))
+        for row, (text, color) in enumerate(lines):
+            draw.text((box[0] + 7, box[1] + 24 + 17 * row), text, font=body_font, fill=color + (255,))
+        radius = 6 if chosen else 4
+        draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius),
+                     fill=(255, 204, 0, 255) if chosen else (255, 255, 255, 255), outline=(16, 39, 52, 255), width=2)
+    return Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
+
+
 class StripChart:
     def __init__(self, parent, title, unit, series, window, symmetric=False):
         import tkinter as tk
         self.canvas = tk.Canvas(parent, bg=WHITE, highlightthickness=1,
-                                highlightbackground=LINE, height=110)
+                                highlightbackground=LINE, height=80)
         self.title, self.unit = title, unit
         self.series, self.window, self.symmetric = series, window, symmetric
         self.points = []
@@ -122,7 +213,7 @@ class StripChart:
         if width < 100 or height < 70:
             return
         c.delete("all")
-        c.create_text(14, 15, text=f"{self.title} / {self.unit}", anchor="w", fill=INK, font=(FONT, 9, "bold"))
+        c.create_text(14, 15, text=f"{self.title} / {self.unit}", anchor="w", fill=INK, font=(FONT, 11, "bold"))
         # Latest values double as the legend, so the current reading is always visible.
         legend_x = width - 14
         for name, color, extract in reversed(self.series):
@@ -131,7 +222,7 @@ class StripChart:
                 text = f"{name} {latest:+.3f}" if latest is not None else f"{name} --"
             else:
                 text = f"{latest:.3f}" if latest is not None else "--"
-            item = c.create_text(legend_x, 15, text=text, anchor="e", fill=color, font=(MONO, 9, "bold"))
+            item = c.create_text(legend_x, 15, text=text, anchor="e", fill=color, font=(MONO, 11, "bold"))
             bounds = c.bbox(item)
             legend_x -= (bounds[2] - bounds[0] if bounds else 60) + 14
         left, right, top, bottom = 58, width - 14, 32, height - 22
@@ -145,13 +236,13 @@ class StripChart:
         for value in (lower, (lower + upper) / 2, upper):
             y = bottom - (value - lower) / (upper - lower) * (bottom - top)
             c.create_line(left, y, right, y, fill=LINE)
-            c.create_text(left - 8, y, text=f"{value:.3g}", anchor="e", fill=MUTED, font=(FONT, 8))
+            c.create_text(left - 8, y, text=f"{value:.3g}", anchor="e", fill=MUTED, font=(FONT, 10))
         start_axis = max(0., max(self.window, end) - self.window)
         for fraction, anchor in ((0., "w"), (.5, "center"), (1., "e")):
             x = left + fraction * (right - left)
             c.create_text(x, height - 9, text=_duration(start_axis + fraction * self.window)
                           if self.window >= 3600 else f"{start_axis + fraction * self.window:.0f} s",
-                          anchor=anchor, fill=MUTED, font=(FONT, 8))
+                          anchor=anchor, fill=MUTED, font=(FONT, 10))
         for _, color, extract in self.series:
             segment = []
             previous = None
@@ -171,7 +262,7 @@ class StripChart:
             self._segment(segment, color)
         if not values:
             c.create_text((left + right) / 2, (top + bottom) / 2, text="Waiting for measurements",
-                          fill=MUTED, font=(FONT, 9))
+                          fill=MUTED, font=(FONT, 11))
 
     def _segment(self, segment, color):
         if len(segment) >= 4:
@@ -204,6 +295,8 @@ class MonitorApp:
         self.health = {}
         self.record_part = None
         self.record_seconds = 0.
+        self.selected_marker = None
+        self._display = None  # (x offset, y offset, scale) of the preview image on its canvas
         self.stall_reported = False
         self._overlay_text = None
         self._next_disk_check = 0.
@@ -220,6 +313,9 @@ class MonitorApp:
         self.saved_var = tk.StringVar(value="Keep the camera and board still to measure jitter. "
                                             "Start recording (Ctrl+R) to save coordinates and measurements.")
         self.health_var = tk.StringVar(value="")
+        self.marker_labels_var = tk.BooleanVar(value=True)
+        self.position_title_var = tk.StringVar(value="BOARD ORIGIN")
+        self.position_note_var = tk.StringVar(value="Click a marker to show its centre. X right / Y down / Z forward.")
         self.disk_var = tk.StringVar(value="")
         self.device_var = tk.StringVar(value="No camera connected")
         self.recognition_var = tk.StringVar(value="Waiting for camera")
@@ -232,8 +328,8 @@ class MonitorApp:
         self.metrics = {key: tk.StringVar(value="--") for key in keys}
         root.title("RealSense | ChArUco board tracker")
         screen_w, screen_h = root.winfo_screenwidth(), root.winfo_screenheight()
-        root.geometry(f"{max(1000, min(1380, screen_w - 40))}x{max(700, min(940, screen_h - 80))}")
-        root.minsize(1000, 700)
+        root.geometry(f"{max(1200, min(1440, screen_w - 40))}x{max(800, min(960, screen_h - 80))}")
+        root.minsize(1200, 800)
         root.configure(bg=BG)
         root.protocol("WM_DELETE_WINDOW", self.close)
         # A plain function: a bound method here would make root and app a reference cycle.
@@ -242,7 +338,7 @@ class MonitorApp:
         root.bind("<Control-r>", lambda event: self.toggle_recording())
         root.bind("<F11>", lambda event: self._fullscreen(not int(root.attributes("-fullscreen"))))
         root.bind("<Escape>", lambda event: self._fullscreen(False))
-        root.option_add("*Font", (FONT, 10))
+        root.option_add("*Font", (FONT, 11))
         self._style()
         self._build(board_names)
         self._log(logging.INFO, f"Monitor started for board {args.board!r}"
@@ -255,19 +351,20 @@ class MonitorApp:
     def _style(self):
         style = self.ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure("TButton", padding=(13, 6), font=(FONT, 10), background=WHITE, foreground=INK, bordercolor=LINE)
+        style.configure("TButton", padding=(13, 6), font=(FONT, 11), background=WHITE, foreground=INK, bordercolor=LINE)
         style.configure("Primary.TButton", background=GREEN, foreground=WHITE, bordercolor=GREEN)
         style.map("Primary.TButton", background=[("active", "#06665c"), ("disabled", "#d7e3e3")], foreground=[("disabled", "#8b9d9e")])
         style.configure("Stop.TButton", background=RED, foreground=WHITE, bordercolor=RED)
         style.map("Stop.TButton", background=[("active", "#9e3038"), ("disabled", "#e9dfe0")], foreground=[("disabled", "#aa9295")])
-        style.configure("Small.TButton", padding=(9, 4), font=(FONT, 9))
-        style.configure("TCheckbutton", background=WHITE, foreground=MUTED, font=(FONT, 9))
+        style.configure("Small.TButton", padding=(10, 4), font=(FONT, 11))
+        style.configure("TCheckbutton", background=WHITE, foreground=MUTED, font=(FONT, 11))
+        style.configure("Heading.TCheckbutton", background=WHITE, foreground=INK, font=(FONT, 11))
         style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(16, 6), font=(FONT, 10), background=BG, foreground=MUTED)
+        style.configure("TNotebook.Tab", padding=(16, 6), font=(FONT, 11), background=BG, foreground=MUTED)
         style.map("TNotebook.Tab", background=[("selected", WHITE)], foreground=[("selected", INK)])
         style.configure("Treeview", background=WHITE, fieldbackground=WHITE, foreground=INK,
-                        rowheight=25, font=(FONT, 10), borderwidth=0)
-        style.configure("Treeview.Heading", background=BG, foreground=MUTED, font=(FONT, 9, "bold"), padding=(8, 6))
+                        rowheight=30, font=(FONT, 11), borderwidth=0)
+        style.configure("Treeview.Heading", background=BG, foreground=MUTED, font=(FONT, 11, "bold"), padding=(8, 6))
 
     def _label(self, parent, text=None, variable=None, **options):
         return self.tk.Label(parent, text=text, textvariable=variable, bg=parent.cget("bg"),
@@ -278,14 +375,14 @@ class MonitorApp:
 
     def _pill(self, parent, variable):
         return self.tk.Label(parent, textvariable=variable, bg=TONES["idle"], fg=WHITE,
-                             font=(FONT, 9, "bold"), padx=10, pady=3)
+                             font=(FONT, 11, "bold"), padx=10, pady=3)
 
     def _build(self, board_names):
         tk, ttk = self.tk, self.ttk
         header = tk.Frame(self.root, bg=BG)
         header.pack(fill="x", padx=20, pady=(10, 8))
-        self._label(header, "Board tracker", font=(FONT, 17, "bold")).pack(side="left")
-        self._label(header, "RealSense / ChArUco", fg=GREEN, font=(FONT, 9, "bold")).pack(side="left", padx=(12, 0), pady=(6, 0))
+        self._label(header, "Board tracker", font=(FONT, 18, "bold")).pack(side="left")
+        self._label(header, "RealSense / ChArUco", fg=GREEN, font=(FONT, 11, "bold")).pack(side="left", padx=(12, 0), pady=(6, 0))
         ttk.Button(header, text="Quit", style="Small.TButton", command=self.close).pack(side="right")
         self.status_badge = self._pill(header, self.status_var)
         self.status_badge.pack(side="right", padx=(8, 12))
@@ -305,14 +402,14 @@ class MonitorApp:
         self.stop_button.pack(side="right")
         self.record_button = ttk.Button(first, text="Start recording", command=self.start_recording, style="Primary.TButton", state="disabled")
         self.record_button.pack(side="right", padx=8)
-        self.record_label = self._label(first, variable=self.record_var, fg=MUTED, font=(FONT, 9))
+        self.record_label = self._label(first, variable=self.record_var, fg=MUTED, font=(FONT, 11))
         self.record_label.pack(side="left", padx=16)
         second = tk.Frame(controls, bg=WHITE)
         second.pack(fill="x", padx=14, pady=(0, 9))
-        self._label(second, "Recordings", fg=MUTED, font=(FONT, 9)).pack(side="left", padx=(0, 10))
+        self._label(second, "Recordings", fg=MUTED, font=(FONT, 11)).pack(side="left", padx=(0, 10))
         self.output_entry = ttk.Entry(second, textvariable=self.output_var)
         self.output_entry.pack(side="left", fill="x", expand=True)
-        self.disk_label = self._label(second, variable=self.disk_var, fg=MUTED, font=(FONT, 9))
+        self.disk_label = self._label(second, variable=self.disk_var, fg=MUTED, font=(FONT, 11))
         self.disk_label.pack(side="left", padx=(10, 0))
         self.browse_button = ttk.Button(second, text="Choose folder...", style="Small.TButton", command=self.browse)
         self.browse_button.pack(side="left", padx=8)
@@ -323,16 +420,16 @@ class MonitorApp:
         statusbar = tk.Frame(self.root, bg=BG)
         statusbar.pack(side="bottom", fill="x", padx=20, pady=(6, 9))
         self.footer_label = self._label(statusbar, variable=self.saved_var, fg=INK, anchor="w", justify="left",
-                                        font=(FONT, 9), wraplength=1280)
+                                        font=(FONT, 11), wraplength=1280)
         self.footer_label.pack(fill="x")
-        self._label(statusbar, variable=self.health_var, fg=MUTED, anchor="w", font=(FONT, 8)).pack(fill="x", pady=(2, 0))
+        self._label(statusbar, variable=self.health_var, fg=MUTED, anchor="w", font=(FONT, 10)).pack(fill="x", pady=(2, 0))
         statusbar.bind("<Configure>", lambda event: self.footer_label.configure(wraplength=max(100, event.width)))
 
         main = tk.Frame(self.root, bg=BG)
         main.pack(fill="both", expand=True, padx=20)
         main.columnconfigure(0, weight=1)
-        main.columnconfigure(1, weight=0, minsize=380)
-        main.rowconfigure(0, weight=3, minsize=300)
+        main.columnconfigure(1, weight=0, minsize=430)
+        main.rowconfigure(0, weight=3, minsize=350)
         main.rowconfigure(1, weight=2, minsize=180)
         self._build_preview(main)
         self._build_stats(main)
@@ -364,16 +461,19 @@ class MonitorApp:
         preview_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=(0, 10))
         preview_heading = tk.Frame(preview_card, bg=WHITE)
         preview_heading.pack(fill="x", padx=14, pady=7)
-        self._label(preview_heading, "LIVE VIEW", font=(FONT, 9, "bold")).pack(side="left")
-        self._label(preview_heading, variable=self.device_var, fg=MUTED, font=(FONT, 8)).pack(side="right")
+        self._label(preview_heading, "LIVE VIEW", font=(FONT, 11, "bold")).pack(side="left")
+        self.ttk.Checkbutton(preview_heading, text="Coordinates on markers", variable=self.marker_labels_var,
+                             style="Heading.TCheckbutton", command=self._render_image).pack(side="left", padx=(16, 0))
+        self._label(preview_heading, variable=self.device_var, fg=MUTED, font=(FONT, 10)).pack(side="right")
         preview_footer = tk.Frame(preview_card, bg=WHITE)
         preview_footer.pack(side="bottom", fill="x")
-        self._label(preview_footer, variable=self.performance_var, fg=MUTED, font=(FONT, 8), anchor="w").pack(side="left", padx=14, pady=5)
-        self._label(preview_footer, "Red: markers  /  Green: corners  /  Axes: X red, Y green, Z blue",
-                    fg=MUTED, font=(FONT, 8), anchor="e").pack(side="right", padx=14, pady=5)
+        self._label(preview_footer, variable=self.performance_var, fg=MUTED, font=(FONT, 10), anchor="w").pack(side="left", padx=14, pady=5)
+        self._label(preview_footer, "Click a marker to select it  /  mm, camera frame",
+                    fg=MUTED, font=(FONT, 10), anchor="e").pack(side="right", padx=14, pady=5)
         self.preview = tk.Canvas(preview_card, bg=PREVIEW_BG, highlightthickness=0)
         self.preview.pack(fill="both", expand=True)
         self.preview.bind("<Configure>", lambda event: self._render_image())
+        self.preview.bind("<Button-1>", self._on_preview_click)
 
     def _build_stats(self, main):
         tk, ttk = self.tk, self.ttk
@@ -381,8 +481,8 @@ class MonitorApp:
         stats.grid(row=0, column=1, sticky="nsew", pady=(0, 10))
         heading = tk.Frame(stats, bg=WHITE)
         heading.pack(fill="x")
-        self._label(heading, "BOARD POSITION", font=(FONT, 9, "bold")).pack(side="left")
-        self._label(heading, "mm, camera frame", fg=MUTED, font=(FONT, 9)).pack(side="left", padx=(8, 0))
+        self._label(heading, variable=self.position_title_var, font=(FONT, 11, "bold")).pack(side="left")
+        self._label(heading, "mm, camera frame", fg=MUTED, font=(FONT, 11)).pack(side="left", padx=(8, 0))
         self.copy_button = ttk.Button(heading, text="Copy XYZ", command=self.copy_coordinates, style="Small.TButton", state="disabled")
         self.copy_button.pack(side="right")
         positions = tk.Frame(stats, bg=WHITE)
@@ -391,25 +491,25 @@ class MonitorApp:
             positions.columnconfigure(index, weight=1, uniform="axis")
             cell = tk.Frame(positions, bg=BG, padx=8, pady=5)
             cell.grid(row=0, column=index, sticky="ew", padx=(0, 6) if index < 2 else 0)
-            self._label(cell, axis, fg=color, font=(FONT, 9, "bold"), anchor="w").pack(fill="x")
-            self._label(cell, variable=self.metrics[axis.lower()], font=(MONO, 17, "bold"), anchor="e").pack(fill="x")
-        self._label(stats, "X right / Y down / Z forward.  Origin: outer top-left corner.", fg=MUTED,
-                    font=(FONT, 8), anchor="w").pack(fill="x", pady=(4, 4))
-        self.pose_state_label = self._label(stats, variable=self.pose_state_var, fg=MUTED, font=(FONT, 9, "bold"), anchor="w")
+            self._label(cell, axis, fg=color, font=(FONT, 11, "bold"), anchor="w").pack(fill="x")
+            self._label(cell, variable=self.metrics[axis.lower()], font=(MONO, 24, "bold"), anchor="e").pack(fill="x")
+        self._label(stats, variable=self.position_note_var, fg=MUTED, font=(FONT, 10), anchor="w",
+                    justify="left", wraplength=400).pack(fill="x", pady=(4, 4))
+        self.pose_state_label = self._label(stats, variable=self.pose_state_var, fg=MUTED, font=(FONT, 11, "bold"), anchor="w")
         self.pose_state_label.pack(fill="x")
-        self._label(stats, variable=self.quality_var, fg=MUTED, font=(FONT, 8), wraplength=350,
+        self._label(stats, variable=self.quality_var, fg=MUTED, font=(FONT, 10), wraplength=400,
                     justify="left", anchor="w").pack(fill="x", pady=(1, 4))
         recognition = tk.Frame(stats, bg=WHITE)
         recognition.pack(fill="x")
-        self.recognition_label = self._label(recognition, variable=self.recognition_var, fg=MUTED, font=(FONT, 10, "bold"), anchor="w")
+        self.recognition_label = self._label(recognition, variable=self.recognition_var, fg=MUTED, font=(FONT, 11, "bold"), anchor="w")
         self.recognition_label.pack(side="left")
-        self._label(recognition, variable=self.metrics["fit"], fg=MUTED, font=(FONT, 9)).pack(side="right")
+        self._label(recognition, variable=self.metrics["fit"], fg=MUTED, font=(FONT, 11)).pack(side="right")
         counts = tk.Frame(stats, bg=WHITE)
         counts.pack(fill="x", pady=(1, 4))
-        self._label(counts, variable=self.metrics["markers"], fg=MUTED, font=(FONT, 9)).pack(side="left")
-        self._label(counts, variable=self.metrics["corners"], fg=MUTED, font=(FONT, 9)).pack(side="right")
+        self._label(counts, variable=self.metrics["markers"], fg=MUTED, font=(FONT, 11)).pack(side="left")
+        self._label(counts, variable=self.metrics["corners"], fg=MUTED, font=(FONT, 11)).pack(side="right")
         self._label(stats, f"JITTER / LAST {self.args.rolling_seconds:g} S / RMS", fg=MUTED,
-                    font=(FONT, 8, "bold"), anchor="w").pack(fill="x", pady=(2, 3))
+                    font=(FONT, 10, "bold"), anchor="w").pack(fill="x", pady=(2, 3))
         jitters = tk.Frame(stats, bg=WHITE)
         jitters.pack(fill="x")
         for index, (caption, key) in enumerate((("Position", "position_jitter"),
@@ -417,17 +517,17 @@ class MonitorApp:
             jitters.columnconfigure(index, weight=1, uniform="jitter")
             cell = tk.Frame(jitters, bg=WHITE)
             cell.grid(row=0, column=index, sticky="ew")
-            self._label(cell, caption, fg=MUTED, font=(FONT, 8), anchor="w").pack(fill="x")
-            self._label(cell, variable=self.metrics[key], font=(MONO, 10, "bold"), anchor="w").pack(fill="x")
+            self._label(cell, caption, fg=MUTED, font=(FONT, 10), anchor="w").pack(fill="x")
+            self._label(cell, variable=self.metrics[key], font=(MONO, 13, "bold"), anchor="w").pack(fill="x")
 
     def _build_table(self):
         tk, ttk = self.tk, self.ttk
         table_page = tk.Frame(self.notebook, bg=WHITE, padx=12, pady=8)
         self.notebook.add(table_page, text="Marker coordinates")
-        note = self._label(table_page, variable=self.coordinate_note_var, fg=MUTED, font=(FONT, 9), anchor="w", justify="left", wraplength=1200)
+        note = self._label(table_page, variable=self.coordinate_note_var, fg=MUTED, font=(FONT, 11), anchor="w", justify="left", wraplength=1200)
         note.pack(fill="x", pady=(0, 6))
         table_page.bind("<Configure>", lambda event: note.configure(wraplength=max(100, event.width - 24)))
-        self._label(table_page, variable=self.ids_var, fg=MUTED, font=(FONT, 8), anchor="w", justify="left",
+        self._label(table_page, variable=self.ids_var, fg=MUTED, font=(FONT, 10), anchor="w", justify="left",
                     wraplength=1200).pack(side="bottom", fill="x", pady=(6, 0))
         container = tk.Frame(table_page, bg=WHITE)
         container.pack(fill="both", expand=True)
@@ -441,6 +541,7 @@ class MonitorApp:
         self.coordinate_table.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         self.coordinate_table.pack(side="left", fill="both", expand=True)
+        self.coordinate_table.bind("<<TreeviewSelect>>", self._on_table_select)
         self.coordinate_table.tag_configure("foreign", foreground=AMBER)
         self.coordinate_table.tag_configure("rejected", foreground=RED)
 
@@ -782,7 +883,7 @@ class MonitorApp:
         if not self._overlay_text:
             return
         width = canvas.winfo_width()
-        item = canvas.create_text(width / 2, 22, text=self._overlay_text, fill=WHITE, font=(FONT, 10, "bold"), tags="overlay")
+        item = canvas.create_text(width / 2, 22, text=self._overlay_text, fill=WHITE, font=(FONT, 11, "bold"), tags="overlay")
         x0, y0, x1, y1 = canvas.bbox(item)
         canvas.tag_lower(canvas.create_rectangle(x0 - 12, y0 - 6, x1 + 12, y1 + 6, fill=AMBER, outline="", tags="overlay"), item)
 
@@ -801,9 +902,7 @@ class MonitorApp:
         self.ids_var.set("\n".join(f"{caption}: {', '.join(map(str, report[key])) or 'none'}" for caption, key in
                                   (("Matched IDs", "matched_marker_ids"), ("Missing IDs", "missing_marker_ids"), ("Other IDs", "foreign_marker_ids"))))
         pose = report["pose"]
-        for index, (axis, _) in enumerate(AXES):
-            self.metrics[axis.lower()].set(f"{pose['position_mm'][index]:+.2f}" if pose else "--")
-        self.copy_button.configure(state="normal" if pose else "disabled")
+        self._show_position(report)
         self.metrics["fit"].set(f"Fit {_number(pose['reprojection_rmse_px'], 'px', 2)}" if pose else "Fit -- px")
         point = report.get("live_jitter") or {}
         for key, source, unit in (("position_jitter", "position_jitter_mm", "mm"), ("rotation_jitter", "rotation_jitter_deg", "deg"), ("corner_jitter", "corner_jitter_px", "px")):
@@ -816,7 +915,7 @@ class MonitorApp:
         elif not pose:
             self.quality_var.set("Markers found. Show more of the board to estimate its position.")
         elif passed:
-            self.quality_var.set("Coordinates and jitter use raw measurements. Image fit does not measure physical accuracy.")
+            self.quality_var.set("Raw, unfiltered pose. Image fit is not physical accuracy.")
         else:
             reasons = report["pose_quality_reasons"]
             message = QUALITY_TEXT.get(reasons[0], reasons[0].replace("_", " ").capitalize()) if reasons else "Review the pose quality."
@@ -831,6 +930,70 @@ class MonitorApp:
         for chart in self.charts:
             chart.set_points(preview["points"])
         self._show_coordinates(report)
+
+    def _selected_position(self, report):
+        """(marker record or None, position in mm or None) for the selected marker."""
+        marker = next((m for m in report.get("marker_coordinates", []) if m["id"] == self.selected_marker), None)
+        return marker, marker["position_mm"] if marker else None
+
+    def _show_position(self, report):
+        if self.selected_marker is None:
+            position = report["pose"]["position_mm"] if report["pose"] else None
+            self.position_title_var.set("BOARD ORIGIN")
+            self.position_note_var.set("Outer top-left pattern corner. Click a marker to show its centre.")
+        else:
+            marker, position = self._selected_position(report)
+            self.position_title_var.set(f"MARKER #{self.selected_marker}")
+            if marker is None:
+                note = "Not visible. Click empty space in the view to show the board origin."
+            elif position is None:
+                note = ("Duplicate ID: position is ambiguous." if marker["duplicate"] else
+                        "Not on the selected board: no position." if not marker["matched"] else
+                        "No board pose yet: show more of the board.")
+            else:
+                note = "Marker centre on the board." + ("" if report["pose_quality_passed"] else
+                                                         " Pose did not pass quality checks.")
+            self.position_note_var.set(note)
+        for index, (axis, _) in enumerate(AXES):
+            self.metrics[axis.lower()].set(f"{position[index]:+.2f}" if position else "--")
+        self.copy_button.configure(state="normal" if position else "disabled")
+
+    def _select_marker(self, marker_id):
+        self.selected_marker = marker_id
+        if self.last_report is not None:
+            self._show_position(self.last_report)
+            self._sync_table_selection()
+        else:
+            self.position_title_var.set(f"MARKER #{marker_id}" if marker_id is not None else "BOARD ORIGIN")
+        self._render_image()
+
+    def _on_preview_click(self, event):
+        report, display = self.last_report, self._display
+        if report is None or display is None:
+            return
+        x0, y0, scale = display
+        best, distance = None, 30.  # Display pixels.
+        for marker in report.get("marker_coordinates", []):
+            u, v = (value * scale for value in marker["pixel_center"])
+            d = math.hypot(event.x - x0 - u, event.y - y0 - v)
+            if d < distance:
+                best, distance = marker["id"], d
+        self._select_marker(None if best is None or best == self.selected_marker else best)
+
+    def _on_table_select(self, event):
+        selection = self.coordinate_table.selection()
+        if selection:
+            marker_id = int(str(selection[0]).split(":")[0])
+            if marker_id != self.selected_marker:
+                self._select_marker(marker_id)
+
+    def _sync_table_selection(self):
+        wanted = [item for item in self.coordinate_table.get_children()
+                  if self.selected_marker is not None and str(item).split(":")[0] == str(self.selected_marker)][:1]
+        if list(self.coordinate_table.selection()) != wanted:
+            self.coordinate_table.selection_set(wanted)
+            if wanted:
+                self.coordinate_table.see(wanted[0])
 
     def _show_coordinates(self, report):
         existing = set(self.coordinate_table.get_children())
@@ -853,6 +1016,7 @@ class MonitorApp:
                 self.coordinate_table.insert("", index, iid=item, values=values, tags=(tag,))
         if existing:
             self.coordinate_table.delete(*existing)
+        self._sync_table_selection()
         suffix = " / Current raw pose did not pass quality checks." if report["pose"] and not report["pose_quality_passed"] else ""
         self.coordinate_note_var.set("u/v: mean of detected corners. X/Y/Z: board-model centres in the camera frame, inferred from the raw pose." + suffix)
 
@@ -863,14 +1027,19 @@ class MonitorApp:
 
     def copy_coordinates(self):
         report = self.last_report
-        if report is None or report["pose"] is None:
+        if report is None:
             return
-        values = report["pose"]["position_mm"]
-        text = "Board origin / camera frame / mm\n" + "\n".join(f"{axis}={value:+.2f}" for (axis, _), value in zip(AXES, values))
+        if self.selected_marker is None:
+            values, subject = (report["pose"]["position_mm"] if report["pose"] else None), "Board origin"
+        else:
+            values, subject = self._selected_position(report)[1], f"Marker {self.selected_marker} centre"
+        if values is None:
+            return
+        text = f"{subject} / camera frame / mm\n" + "\n".join(f"{axis}={value:+.2f}" for (axis, _), value in zip(AXES, values))
         text += f"\nCamera axes: X right, Y down, Z forward\nQuality passed: {report['pose_quality_passed']}"
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
-        self.saved_var.set("Copied the displayed board coordinates in mm, with camera-frame and quality labels.")
+        self.saved_var.set(f"Copied {subject.lower()} coordinates in mm, with camera-frame and quality labels.")
 
     def _preview_message(self):
         if self.reconnecting:
@@ -887,12 +1056,20 @@ class MonitorApp:
         if self.last_image is None:
             self.preview.delete("all")
             self.image_item = None
+            self._display = None
             self.preview.create_text(width / 2, height / 2, text=self._preview_message(), fill="#a4beca",
-                                     font=(FONT, 12), justify="center", width=max(200, width - 80))
+                                     font=(FONT, 13), justify="center", width=max(200, width - 80))
             self._draw_overlay()
             return
         image = Image.fromarray(self.last_image[:, :, ::-1])
+        full_width = image.width
         image.thumbnail((max(1, width), max(1, height)), Image.Resampling.BILINEAR)
+        scale = image.width / full_width
+        self._display = ((width - image.width) / 2, (height - image.height) / 2, scale)
+        report = self.last_report
+        if report is not None and self.marker_labels_var.get() and report.get("marker_coordinates"):
+            image = annotate_markers(image, report["marker_coordinates"], scale, self.selected_marker,
+                                     report["pose_quality_passed"])
         # Reuse one Tk image while the size is unchanged; avoids per-frame image churn.
         if self.photo is not None and (self.photo.width(), self.photo.height()) == image.size:
             self.photo.paste(image)

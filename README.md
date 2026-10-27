@@ -96,6 +96,15 @@ before connecting, or disconnect to switch boards. The window shows:
   is its outer top-left pattern corner. **Copy XYZ** includes units and quality.
 - Matched-marker/corner counts, image-fit error, processing rate, and plain-language
   quality feedback. Coordinates clear immediately when a pose is unavailable.
+- **Coordinates on markers**: each detected marker is labelled in the live view
+  with its ID and centre X/Y/Z in mm (camera frame). Labels are placed so they do
+  not cover each other; where there is no room a marker keeps a compact `#ID` tag.
+  **Click a marker** (or its table row) to select it: it is highlighted, its label
+  is always shown, and the large X/Y/Z readout and **Copy XYZ** switch from the
+  board origin to that marker's centre. Click empty space to return to the board
+  origin. Amber label borders mean the board pose failed its quality checks;
+  markers from another board or with duplicate IDs have no coordinates. Untick
+  **Coordinates on markers** to hide the labels.
 - A **Marker coordinates** tab with each detected ID, board match, image centre
   u/v in pixels, and inferred marker-centre X/Y/Z in camera coordinates.
 - Time plots of X/Y/Z displacement from the first pose, position RMS jitter,
@@ -111,7 +120,7 @@ before connecting, or disconnect to switch boards. The window shows:
   processing errors, and the log file path.
 
 Keyboard: **Ctrl+R** starts/stops recording, **F11** toggles full screen,
-**Esc** leaves full screen, **Ctrl+Q** quits. The window fits 1000 x 700 screens.
+**Esc** leaves full screen, **Ctrl+Q** quits. The window needs at least 1200 x 800.
 
 Choose the parent destination folder and press **Start recording**. Each click
 starts a new `run-YYYYMMDD-HHMMSS-...` directory and resets the live history and
@@ -137,7 +146,10 @@ mean insufficient or missing observations, rather than zero jitter.
 
 Marker image centres are the arithmetic mean of their four detected corners.
 Marker X/Y/Z are calculated from known board geometry and the raw board pose;
-they are **not depth measurements or independent per-marker poses**. Other-board
+they are **not depth measurements or independent per-marker poses**. They are
+in the **camera** optical frame: a robot such as a UR10e needs them transformed
+into its base frame with a hand-eye (camera-to-robot) calibration before use as
+pick or place targets. Other-board
 IDs and duplicate IDs have no inferred X/Y/Z. A solved pose that fails quality
 checks remains visible and recorded with its quality flag; it is never silently
 presented as accepted. JSONL includes `marker_coordinates`; `session.json` records
@@ -498,6 +510,15 @@ with RealsenseCamera() as camera:
 
 The single-image `detect_charuco(board, gray, border_bits, intrinsics=None)` helper
 remains available. For sequences, reuse `CharucoDetector` as above.
+
+The detector re-refines ChArUco chessboard intersections on the original image to correct the
+approximately +0.5 px offset in OpenCV 4.11's `detectBoard` output
+([OpenCV issue #25539](https://github.com/opencv/opencv/issues/25539)). Marker corners are unchanged.
+The window scales with corner spacing and frames with a refinement displacement over one pixel
+lose their ChArUco corners, so they cannot produce a pose from that suspect refinement. This
+applies to still-image detection, streaming, the monitor and headless service. Session metadata
+records `charuco_corner_refinement: true`. Use `CharucoDetector(board, refine=False)` only for
+diagnostics or when the caller performs its own image-based refinement.
 
 References: [OpenCV ChArUco detection](https://docs.opencv.org/4.11.0/df/d4a/tutorial_charuco_detection.html),
 [OpenCV pose solvers](https://docs.opencv.org/4.11.0/d5/d1f/calib3d_solvePnP.html),
