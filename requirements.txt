@@ -5,6 +5,10 @@ pytest==8.4.2
 # Pillow supplies the desktop UI preview and renders test reference PNGs;
 # the conflicting opencv-contrib-python-headless is intentionally omitted.
 Pillow==12.0.0
+reportlab==4.4.5
+pypdf==6.1.3
+packaging==25.0
+charset-normalizer==3.4.4
 # charuco-generator is installed separately with --no-deps (it provides its own
 # OpenCV pin that conflicts with the GUI build needed for the stream command):
 #   pip install -e ../charuco-generator --no-deps

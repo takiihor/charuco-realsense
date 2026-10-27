@@ -194,3 +194,24 @@ def test_frame_timeout_is_bounded(sdk, monkeypatch):
         camera._pipeline.try_wait_for_frames = lambda timeout_ms: (False, None)
         with pytest.raises(CameraError, match="5 seconds"):
             camera.read()
+
+
+def test_interrupted_camera_construction_closes_started_pipeline(sdk, monkeypatch):
+    pipelines = []
+    original = sdk.pipeline
+    def pipeline(context):
+        instance = original(context)
+        pipelines.append(instance)
+        start = instance.start
+        def interrupted(config):
+            profile = start(config)
+            def interrupted_profile(stream):
+                raise KeyboardInterrupt
+            profile.get_stream = interrupted_profile
+            return profile
+        instance.start = interrupted
+        return instance
+    monkeypatch.setattr(sdk, 'pipeline', pipeline)
+    with pytest.raises(KeyboardInterrupt):
+        RealsenseCamera('first')
+    assert pipelines[0].stopped
