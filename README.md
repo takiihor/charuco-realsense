@@ -29,6 +29,15 @@ up the environment and run any command below.
 # Or explicitly select a board
 .venv/bin/python main.py gui --board front
 
+# Desktop UI that starts recording on its own (for unattended stations)
+./start_camera.sh gui --board front --auto-record
+
+# Headless 24/7 recorder: reconnects, hourly parts, logs, systemd watchdog
+./start_camera.sh service --board front --output-dir output/24x7
+
+# Stop RealSense camera clients if a process is stuck
+./kill.sh
+
 .venv/bin/python main.py list
 
 # Offline recognition
@@ -80,26 +89,59 @@ otherwise 1. Recognition success does not imply pose success or accuracy.
 Run `./start_camera.sh` to open the UI and connect the camera. Select a board
 before connecting, or disconnect to switch boards. The window shows:
 
-- Live marker outlines and IDs, with ChArUco corners overlaid in green.
-- Matched/missing/foreign marker IDs, corner counts, position, image-fit error,
-  and pose-quality feedback.
+- Live marker outlines and IDs, green ChArUco corners, and the board's pose axes
+  (X red, Y green, Z blue; 30 mm long).
+- Large, signed **X / Y / Z** readouts in **millimetres**, showing the board origin
+  in the camera optical frame: **X right, Y down, Z forward**. The board origin
+  is its outer top-left pattern corner. **Copy XYZ** includes units and quality.
+- Matched-marker/corner counts, image-fit error, processing rate, and plain-language
+  quality feedback. Coordinates clear immediately when a pose is unavailable.
+- A **Marker coordinates** tab with each detected ID, board match, image centre
+  u/v in pixels, and inferred marker-centre X/Y/Z in camera coordinates.
 - Time plots of X/Y/Z displacement from the first pose, position RMS jitter,
-  rotation RMS jitter, and corner RMS jitter. Missing observations create gaps.
+  rotation RMS jitter, and corner RMS jitter, each with its latest value. Missing
+  observations and camera outages create gaps.
 - **Start recording** and **Stop & save** controls, a recording timer/frame count,
-  a destination folder picker, and an optional raw-PNG checkbox.
+  a destination folder picker with free disk space, and an optional raw-PNG checkbox.
+- Status pills for the camera (live, reconnecting, error, stalled) and recording
+  (`REC hh:mm:ss`, `REC PAUSED` during a camera outage), and an amber banner over
+  the preview when frames stop arriving.
+- An **Event log** tab (connections, outages, saved parts, warnings; newest first)
+  and a status bar with uptime, processed frames, camera frame drops, dropouts,
+  processing errors, and the log file path.
+
+Keyboard: **Ctrl+R** starts/stops recording, **F11** toggles full screen,
+**Esc** leaves full screen, **Ctrl+Q** quits. The window fits 1000 x 700 screens.
 
 Choose the parent destination folder and press **Start recording**. Each click
 starts a new `run-YYYYMMDD-HHMMSS-...` directory and resets the live history and
 displacement baseline. **Stop & save** finalizes the session while keeping the
 preview running. Disconnecting or closing the window also saves an active
-recording and releases the camera. Camera errors finalize partial recordings.
+recording and releases the camera. If the camera fails or is unplugged, the
+current part is saved and the UI reconnects automatically; see
+[24/7 operation](#247-operation). **Quit**, **Ctrl+Q** inside the window, and **Ctrl+C** in the launching terminal
+also close the camera. SIGINT and SIGTERM save an interrupted recording before
+exiting with 130 and 143 respectively. Frame waits check cancellation every
+100 ms, including during camera warmup.
 
 UI recordings include the normal `session.json`, `frames.jsonl`, and
 `summary.json`, plus **`jitter.csv`** with a row per processed frame: elapsed
-seconds, X/Y/Z displacement, rolling position/rotation/corner jitter, recognition
-and pose-quality flags, and marker/corner counts. The same live measurements are
+seconds, absolute board X/Y/Z in mm, X/Y/Z displacement, rolling position/rotation/corner
+jitter, recognition and pose-quality flags, marker/corner counts, hardware timestamp,
+and frame number. **`markers.csv`** has one row per detected marker per frame:
+elapsed time, frame number, ID, match/duplicate flags, centre u/v, inferred X/Y/Z,
+and board-pose quality. Frames with no detected markers have no marker rows;
+they remain in `jitter.csv` and `frames.jsonl`. The same live measurements are
 stored under `live_jitter` in each JSONL record. Empty CSV cells and JSON nulls
 mean insufficient or missing observations, rather than zero jitter.
+
+Marker image centres are the arithmetic mean of their four detected corners.
+Marker X/Y/Z are calculated from known board geometry and the raw board pose;
+they are **not depth measurements or independent per-marker poses**. Other-board
+IDs and duplicate IDs have no inferred X/Y/Z. A solved pose that fails quality
+checks remains visible and recorded with its quality flag; it is never silently
+presented as accepted. JSONL includes `marker_coordinates`; `session.json` records
+the coordinate conventions.
 
 The default rolling window is 2 seconds and the chart shows 30 seconds. Change
 them with `gui --rolling-seconds 3 --window-seconds 60`. Rolling position jitter
@@ -112,7 +154,8 @@ interpret these as jitter. Preview refresh is capped at 10 Hz, independently of
 recording every processed frame.
 
 The UI also accepts the usual camera, calibration, solver and reference-pose
-options, plus `--output-dir` (default `output`) and `--save-frames`. A static
+options, plus `--output-dir` (default `output`), `--save-frames`, `--auto-record`
+and the 24/7 options below. A static
 reference pose and any exposure lock remain fixed until disconnecting. UI chart
 history is bounded to 5,000 samples; the recording retains all processed frames.
 
@@ -121,6 +164,109 @@ Pillow; package-only installs can use `pip install -e '.[gui]'`. If Tkinter is
 missing, install Tk support for the Python interpreter you use (commonly
 `python3-tk` on Debian/Ubuntu). The `detect`, `benchmark`, and `summarize` commands
 continue to work without Tkinter or a desktop display.
+
+## 24/7 operation
+
+Both `gui` and the headless `service` command are built for unattended use:
+
+- **Automatic reconnection.** A camera error, unplug or 5-second frame timeout
+  saves the current recording part with status `error`, then reconnects with
+  exponential backoff (1, 2, 4 ... up to `--reconnect-max-seconds`, default 30 s).
+  After every `--hardware-reset-after` failed attempts (default 3; 0 disables) an
+  idle, enumerable camera receives a RealSense hardware reset. Recording resumes
+  in a new part when frames return. `--no-reconnect` restores stop-on-error.
+- **Recording parts.** A recording series starts in `run-YYYYMMDD-HHMMSS-ffffff/`.
+  Every `--segment-minutes` (default 60; 0 disables) and after each reconnect, the
+  next part is written to a sibling `run-...-part0002/`, `-part0003/`, and so on.
+  Every part is a complete recording directory (`session.json`, `frames.jsonl`,
+  `summary.json`, CSVs) that `summarize` reads on its own. `session.json`
+  records `segment: {series, part, reason, segment_minutes}`, with reason `start`,
+  `rotation` or `reconnect`. Elapsed time and the displacement baseline continue
+  across the parts of a series; `frame_index` and image names restart per part.
+  Parts bound per-recording memory (about 300 bytes per frame for statistics,
+  ~30 MB per hour at 30 fps) and file sizes.
+- **Disk guard.** Recording stops, and the preview continues, when free space
+  under the recording folder falls below `--min-free-gb` (default 2 GB). The
+  UI shows free space next to the folder (amber below 5x the limit, red below it).
+  Budget roughly 4–5 KB of JSONL per frame with a pose (about 12–15 GB/day at
+  30 fps, more for boards with many corners) plus the CSVs. Raw PNG frames are
+  ~1.5 MB each at 1280 x 720 (about 4 TB/day at 30 fps); use them only for
+  short runs. Old recordings are never deleted automatically.
+- **Fault isolation.** A frame that fails processing is skipped and counted
+  (30 consecutive failures trigger a reconnect). A storage error such as a full
+  or removed disk stops the recording but keeps the camera running. A failing
+  UI callback is logged and never stops the window's event loop.
+- **Logs.** Events go to stderr and a rotating log file (10 MB x 5) at
+  `OUTPUT_DIR/logs/charuco-realsense.log`; choose another file with `--log-file`
+  or disable it with `--log-file ''`.
+- **Hung camera detection.** Recordings are finalized *before* the camera is
+  released, because stopping a pipeline on a lost USB device can block. If the
+  capture thread makes no progress for `--stall-seconds` (default 30), the UI
+  shows **Camera stalled**, and the systemd watchdog stops being fed so the
+  service restarts. When quitting, the UI waits up to 20 s for the camera after
+  the recording is saved (120 s at most), then exits anyway.
+
+### Running as a service
+
+`service` records without a display until SIGINT/SIGTERM (exit 130/143), or
+until a non-camera error (exit 2). `--no-record` only monitors and logs. It
+implements the systemd notify protocol (`READY`, `STATUS`, `WATCHDOG`) with
+the standard library, so the template in
+[`deploy/charuco-realsense.service`](deploy/charuco-realsense.service) runs it
+with `Type=notify`, `WatchdogSec=90` and `Restart=always`:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp deploy/charuco-realsense.service ~/.config/systemd/user/  # adjust paths/board
+systemctl --user daemon-reload
+systemctl --user enable --now charuco-realsense
+sudo loginctl enable-linger "$USER"   # start at boot without a login
+journalctl --user -u charuco-realsense -f
+```
+
+To run the desktop UI unattended instead, autostart it in the desktop session,
+for example with `~/.config/autostart/charuco-monitor.desktop`:
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=ChArUco monitor
+Exec=/home/USER/development/charuco-realsense/start_camera.sh gui --board front --auto-record
+```
+
+### Host checklist
+
+- Use a USB 3 port and cable; check that the stream reports the intended profile.
+- Disable USB autosuspend, a common cause of RealSense dropouts on long runs:
+  add `usbcore.autosuspend=-1` to the kernel command line, or for the current
+  boot `echo -1 | sudo tee /sys/module/usbcore/parameters/autosuspend`.
+- Disable system sleep/suspend and screen locking that could stop the session.
+- Install the librealsense udev rules so the camera is accessible after
+  re-enumeration (needed for reconnects and hardware resets).
+- Keep the recording folder on a disk sized for the retention you need, and
+  archive or delete old `run-*` directories yourself.
+
+## Stop stuck camera processes
+
+```sh
+./kill.sh --dry-run  # Inspect matching processes without stopping them
+./kill.sh            # SIGINT, wait 5 s, then SIGTERM and finally SIGKILL if needed
+./kill.sh --grace 15 # Allow more time to save a large recording
+./kill.sh --force    # Immediately SIGKILL matched clients; cannot save a summary
+```
+
+This Linux script needs only system Python, not the virtual environment or SDK.
+It stops inspectable RealSense clients owned by the current user: this repo's
+camera processes, RealSense SDK tools/viewer, and other processes with loaded
+`pyrealsense2`/`librealsense2` libraries. It checks executable arguments and loaded
+libraries, excludes itself and its caller ancestry, and checks process identity
+before signalling. It does not match arbitrary text in terminal/editor commands.
+Use the same account that started the camera client.
+
+The script reports each PID and signal. A forced kill skips recording finalization
+and exposure-setting restoration; complete JSONL lines can still be analysed with
+`summarize`. A process stuck inside an uninterruptible kernel/USB operation can
+remain until that operation returns, even after SIGKILL.
 
 ## Recording files
 
@@ -141,8 +287,12 @@ Each recording directory contains:
 
 JSONL is flushed after every frame. No temporal smoothing is applied. Logging,
 image encoding, capture, and GUI time are excluded from `processing_ms` but affect
-observed throughput. Per-corner statistics use online moments; pose arrays and
-scalar timing samples remain in memory for exact percentiles and rotation means.
+observed throughput. Per-corner statistics use online moments; pose and timing
+samples remain in memory (compact float arrays, about 300 bytes per frame) for
+exact percentiles and rotation means. Long `benchmark`/`stream` recordings
+therefore grow memory linearly; the UI and `service` bound it with recording parts.
+UI and `service` recordings may also be split into parts; see
+[24/7 operation](#247-operation).
 
 ## Interpreting the measurements
 

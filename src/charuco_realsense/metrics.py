@@ -1,4 +1,6 @@
 """Repeatability and reference-pose accuracy statistics for raw frame records."""
+from array import array
+from collections import Counter
 import json
 from pathlib import Path
 
@@ -52,6 +54,13 @@ def _distribution(values):
             "p95": float(np.percentile(values, 95)), "max": float(values.max())}
 
 
+def rotation_angles_deg(rotations, reference) -> np.ndarray:
+    """Vectorized rotation_angle_deg for an (N, 3, 3) stack; fast for long sessions."""
+    rotations = np.asarray(rotations, float).reshape(-1, 3, 3)
+    cosine = (np.einsum("nij,ij->n", rotations, np.asarray(reference, float)) - 1.) / 2.
+    return np.degrees(np.arccos(np.clip(cosine, -1., 1.)))
+
+
 def _mean_rotation(rotations):
     u, _, vh = np.linalg.svd(np.asarray(rotations).sum(axis=0))
     correction = np.diag([1., 1., np.linalg.det(u @ vh)])
@@ -82,24 +91,28 @@ class _Moments:
 
 
 class _PoseSeries:
+    """Flat float64 buffers: about 130 bytes per pose instead of ~800 for small arrays."""
+
     def __init__(self):
-        self.positions = []
-        self.rotations = []
-        self.rmse = []
-        self.all_rmse = []
-        self.coverage = []
-        self.corner_counts = []
+        self.positions = array("d")
+        self.rotations = array("d")
+        self.rmse = array("d")
+        self.all_rmse = array("d")
+        self.coverage = array("d")
+        self.corner_counts = array("d")
 
     def add(self, pose):
-        self.positions.append(np.asarray(pose["tvec_m"], float) * 1000.)
-        self.rotations.append(np.asarray(pose["rotation_matrix"], float))
+        position = np.asarray(pose["tvec_m"], float).reshape(3) * 1000.
+        rotation = np.asarray(pose["rotation_matrix"], float).reshape(9)
+        self.positions.extend(position.tolist())
+        self.rotations.extend(rotation.tolist())
         self.rmse.append(pose["reprojection_rmse_px"])
         self.all_rmse.append(pose["all_corner_reprojection_rmse_px"])
         self.coverage.append(pose["board_coverage_fraction"])
         self.corner_counts.append(pose["inlier_count"])
 
     def summary(self, reference):
-        n = len(self.positions)
+        n = len(self.rmse)
         result = {"samples": n, "position_jitter": None, "rotation_jitter": None,
                   "reprojection_rmse_px": _distribution(self.rmse),
                   "all_corner_reprojection_rmse_px": _distribution(self.all_rmse),
@@ -107,12 +120,13 @@ class _PoseSeries:
                   "inlier_corner_count": _distribution(self.corner_counts), "accuracy": None}
         if not n:
             return result
-        positions = np.asarray(self.positions)
+        positions = np.array(self.positions, float).reshape(-1, 3)
+        rotations = np.array(self.rotations, float).reshape(-1, 3, 3)
         mean = positions.mean(axis=0)
-        mean_rotation = _mean_rotation(self.rotations)
+        mean_rotation = _mean_rotation(rotations)
         window = max(1, min(30, n // 10))
         displacement = np.linalg.norm(positions - mean, axis=1)
-        angles = [rotation_angle_deg(r, mean_rotation) for r in self.rotations]
+        angles = rotation_angles_deg(rotations, mean_rotation)
         result["position_jitter"] = {
             "mean_mm": mean.tolist(),
             "std_xyz_mm": positions.std(axis=0, ddof=1).tolist() if n > 1 else None,
@@ -125,8 +139,8 @@ class _PoseSeries:
         result["rotation_jitter"] = {
             "mean_rotation_matrix": mean_rotation.tolist(),
             "angular_deviation_deg": _distribution(angles) if n > 1 else None,
-            "drift_deg": rotation_angle_deg(_mean_rotation(self.rotations[-window:]),
-                                               _mean_rotation(self.rotations[:window])) if n > 1 else None,
+            "drift_deg": rotation_angle_deg(_mean_rotation(rotations[-window:]),
+                                               _mean_rotation(rotations[:window])) if n > 1 else None,
         }
         if reference is not None:
             delta = positions - np.asarray(reference["tvec_m"]) * 1000.
@@ -135,8 +149,7 @@ class _PoseSeries:
                 "translation_bias_xyz_mm": bias.tolist(),
                 "translation_bias_norm_mm": float(np.linalg.norm(bias)),
                 "translation_error_norm_mm": _distribution(np.linalg.norm(delta, axis=1)),
-                "rotation_error_deg": _distribution([
-                    rotation_angle_deg(r, reference["rotation_matrix"]) for r in self.rotations]),
+                "rotation_error_deg": _distribution(rotation_angles_deg(rotations, reference["rotation_matrix"])),
             }
         return result
 
@@ -157,8 +170,8 @@ class SessionStatistics:
         self.longest_dropouts = dict.fromkeys(self.counts, 0)
         self.all_poses = _PoseSeries()
         self.accepted_poses = _PoseSeries()
-        self.processing_times = []
-        self.intervals = []
+        self.processing_times = array("d")
+        self.intervals = array("d")
         self.first_time = self.last_time = None
         self.last_frame_number = None
         self.last_timestamp = None
@@ -184,9 +197,9 @@ class SessionStatistics:
             self.quality_reasons[reason] = self.quality_reasons.get(reason, 0) + 1
         # Duplicate corner IDs are ambiguous; do not count either observation.
         observations = record["charuco_corners"]
-        ids = [p["id"] for p in observations]
+        ids = Counter(p["id"] for p in observations)
         for point in observations:
-            if point["id"] in self.corners and ids.count(point["id"]) == 1:
+            if point["id"] in self.corners and ids[point["id"]] == 1:
                 pixel = np.asarray(point["pixel"], float)
                 if pixel.shape != (2,) or not np.isfinite(pixel).all():
                     raise ValueError("Recorded corner pixels must be finite 2D coordinates")

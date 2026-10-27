@@ -1,11 +1,16 @@
 """Intel RealSense capture; the SDK is imported only when hardware is used."""
 from dataclasses import dataclass
+import time
 
 import numpy as np
 
 
 class CameraError(RuntimeError):
     pass
+
+
+class CameraCancelled(CameraError):
+    """A requested shutdown, rather than a camera failure."""
 
 
 @dataclass(frozen=True)
@@ -54,6 +59,25 @@ def list_devices() -> list[dict]:
         raise CameraError(f"Cannot list RealSense devices: {exc}") from exc
 
 
+def reset_device(serial: str | None = None) -> bool:
+    """Hardware-reset an enumerable, idle camera to recover a wedged USB device.
+
+    The device re-enumerates a few seconds later. Returns False if no matching
+    device is visible; with no serial, only a single connected device is reset.
+    """
+    rs = _realsense()
+    try:
+        devices = list(rs.context().query_devices())
+        if serial is not None:
+            devices = [d for d in devices if d.get_info(rs.camera_info.serial_number) == serial]
+        if len(devices) != 1:
+            return False
+        devices[0].hardware_reset()
+        return True
+    except RuntimeError as exc:
+        raise CameraError(f"Cannot reset RealSense device: {exc}") from exc
+
+
 # color_w/h/fps, depth_w/h/fps (depth is optional).
 _FALLBACKS = ((1280, 720, 15, 640, 480, 15),
               (640, 480, 30, 640, 480, 30),
@@ -63,11 +87,13 @@ _FALLBACKS = ((1280, 720, 15, 640, 480, 15),
 class RealsenseCamera:
     """A selected device's color stream, with optional depth for future fusion."""
 
-    def __init__(self, serial: str | None = None, config: StreamConfig = StreamConfig()):
+    def __init__(self, serial: str | None = None, config: StreamConfig = StreamConfig(), stop_event=None):
         self._rs = rs = _realsense()
+        self._stop_event = stop_event
         self._started = False
         self._restore_options = []
         try:
+            self._check_cancelled()
             self._ctx = rs.context()
             self._device = self._select_device(serial)
             self.serial = self._device.get_info(rs.camera_info.serial_number)
@@ -77,6 +103,7 @@ class RealsenseCamera:
             candidates = [requested] + [c for c in _FALLBACKS if c != requested]
             last_error = None
             for cw, ch, cfps, dw, dh, dfps in candidates:
+                self._check_cancelled()
                 pipeline_config = rs.config()
                 pipeline_config.enable_device(self.serial)
                 pipeline_config.enable_stream(rs.stream.color, cw, ch, rs.format.rgb8, cfps)
@@ -88,6 +115,7 @@ class RealsenseCamera:
                     last_error = exc
                     continue
                 self._started = True
+                self._check_cancelled()
                 self._device = profile.get_device()
                 color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
                 intr = color_profile.get_intrinsics()
@@ -112,6 +140,10 @@ class RealsenseCamera:
             if isinstance(exc, CameraError):
                 raise
             raise CameraError(f"Cannot start RealSense camera: {exc}") from exc
+
+    def _check_cancelled(self):
+        if self._stop_event is not None and self._stop_event.is_set():
+            raise CameraCancelled("Camera shutdown requested")
 
     def _select_device(self, serial: str | None):
         devices = self._ctx.query_devices()
@@ -175,7 +207,17 @@ class RealsenseCamera:
 
     def read(self) -> Frame:
         try:
-            frames = self._pipeline.wait_for_frames(timeout_ms=5000)
+            # Short SDK waits let Python handle signals and the GUI cancel reads.
+            # A missing camera still has the same overall five-second timeout.
+            deadline = time.monotonic() + 5.
+            while True:
+                self._check_cancelled()
+                available, frames = self._pipeline.try_wait_for_frames(timeout_ms=100)
+                if available:
+                    break
+                if time.monotonic() >= deadline:
+                    raise CameraError("No RealSense frames received for 5 seconds; check the camera connection")
+            self._check_cancelled()
             color = frames.get_color_frame()
             if not color:
                 raise CameraError("No color frame from RealSense pipeline")

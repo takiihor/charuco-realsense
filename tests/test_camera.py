@@ -1,10 +1,11 @@
 from types import SimpleNamespace as NS
+import threading
 
 import numpy as np
 import pytest
 
 from charuco_realsense import camera as module
-from charuco_realsense.camera import CameraError, RealsenseCamera, StreamConfig
+from charuco_realsense.camera import CameraCancelled, CameraError, RealsenseCamera, StreamConfig
 
 
 @pytest.fixture
@@ -78,14 +79,14 @@ def sdk(monkeypatch):
             return NS(get_device=lambda: next(d for d in devices if d.serial == config.serial),
                       get_stream=lambda stream: profiles[stream])
 
-        def wait_for_frames(self, timeout_ms):
+        def try_wait_for_frames(self, timeout_ms):
             if self.read_error:
                 raise RuntimeError("disconnected")
             pixels = np.zeros((720, 1280, 3), np.uint8)
             pixels[:, :, :] = [10, 20, 30]
             color = NS(get_data=lambda: pixels, get_timestamp=lambda: 123., get_frame_number=lambda: 7,
                        get_frame_timestamp_domain=lambda: "hardware_clock")
-            return NS(get_color_frame=lambda: color)
+            return True, NS(get_color_frame=lambda: color)
 
         def stop(self):
             self.stopped = True
@@ -146,3 +147,50 @@ def test_read_errors_become_camera_errors_and_release_device(sdk):
             pipeline = camera._pipeline
             camera.read()
     assert pipeline.stopped
+
+
+def test_cancel_waiting_for_frames_releases_camera(sdk):
+    cancelled = threading.Event()
+    with RealsenseCamera("first", stop_event=cancelled) as camera:
+        calls = []
+
+        def no_frame(timeout_ms):
+            calls.append(timeout_ms)
+            cancelled.set()
+            return False, None
+        camera._pipeline.try_wait_for_frames = no_frame
+        with pytest.raises(CameraCancelled):
+            camera.read()
+        assert calls == [100]
+        pipeline = camera._pipeline
+    assert pipeline.stopped
+
+
+def test_cancel_connection_skips_fallback_profiles(sdk):
+    cancelled = threading.Event()
+    pipelines = []
+    original_pipeline = sdk.pipeline
+
+    def pipeline(context):
+        result = original_pipeline(context)
+        original_start = result.start
+
+        def start(config):
+            cancelled.set()
+            return original_start(config)  # The first profile fails as usual.
+        result.start = start
+        pipelines.append(result)
+        return result
+    sdk.pipeline = pipeline
+    with pytest.raises(CameraCancelled):
+        RealsenseCamera("first", stop_event=cancelled)
+    assert len(pipelines[0].attempts) == 1
+
+
+def test_frame_timeout_is_bounded(sdk, monkeypatch):
+    with RealsenseCamera("first") as camera:
+        clock = iter([0., 6.])
+        monkeypatch.setattr(module.time, "monotonic", lambda: next(clock))
+        camera._pipeline.try_wait_for_frames = lambda timeout_ms: (False, None)
+        with pytest.raises(CameraError, match="5 seconds"):
+            camera.read()
