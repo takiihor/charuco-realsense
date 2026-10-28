@@ -10,6 +10,7 @@ import signal
 import time
 
 from .cli import _load_board
+from .camera import CAMERA_MODELS
 from .monitor import CaptureWorker, _free_bytes
 from .service import (Watchdog, _give_up_waiting, configure_logging, default_log_file, describe_event, log,
                       recording_path)
@@ -305,6 +306,7 @@ class MonitorApp:
         self.log_path = log_path
         _choose_fonts(root)
         self.board_var = tk.StringVar(value=args.board)
+        self.camera_model_var = tk.StringVar(value=getattr(args, "camera_model", "auto"))
         self.output_var = tk.StringVar(value=args.output_dir)
         self.save_frames_var = tk.BooleanVar(value=args.save_frames)
         self.status_var = tk.StringVar(value="Disconnected")
@@ -393,6 +395,10 @@ class MonitorApp:
         controls.pack(fill="x", padx=20, pady=(0, 10))
         first = tk.Frame(controls, bg=WHITE)
         first.pack(fill="x", padx=14, pady=(9, 7))
+        self._label(first, "Camera model", fg=MUTED).pack(side="left", padx=(0, 9))
+        self.camera_model_box = ttk.Combobox(first, textvariable=self.camera_model_var, values=CAMERA_MODELS,
+                                            state="readonly", width=8)
+        self.camera_model_box.pack(side="left", padx=(0, 14))
         self._label(first, "Board", fg=MUTED).pack(side="left", padx=(0, 9))
         self.board_box = ttk.Combobox(first, textvariable=self.board_var, values=board_names, state="readonly", width=12)
         self.board_box.pack(side="left", padx=(0, 10))
@@ -617,6 +623,7 @@ class MonitorApp:
             return
         args = copy.copy(self.args)
         args.board = self.board_var.get()
+        args.camera_model = self.camera_model_var.get()
         self.worker = self.worker_factory(args)
         self.connected = self.reconnecting = self.stall_reported = False
         self._clear_measurements()
@@ -627,9 +634,10 @@ class MonitorApp:
         self.recognition_label.configure(fg=MUTED)
         self.record_var.set("Preview only")
         self.board_box.configure(state="disabled")
+        self.camera_model_box.configure(state="disabled")
         # Connecting can retry indefinitely; the button stays available to cancel it.
         self.connect_button.configure(text="Disconnect", state="normal")
-        self._log(logging.INFO, f"Connecting to the camera for board {args.board!r}")
+        self._log(logging.INFO, f"Connecting to camera model {args.camera_model!r} for board {args.board!r}")
         if getattr(self.args, "auto_record", False):
             self._request_recording()
         self.worker.start()
@@ -767,6 +775,7 @@ class MonitorApp:
             self._clear_measurements()
             self._recording_ended()
             self.board_box.configure(state="readonly")
+            self.camera_model_box.configure(state="readonly")
             self.connect_button.configure(text="Connect camera", state="normal")
             self.record_button.configure(state="disabled")
 

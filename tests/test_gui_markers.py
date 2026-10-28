@@ -65,6 +65,40 @@ def app(tmp_path):
     root.destroy()
 
 
+def test_camera_model_selection_is_passed_to_worker_and_unlocked_after_disconnect(app):
+    class Worker:
+        def __init__(self, args):
+            self.args = args
+            self.alive = False
+
+        def start(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def disconnect(self):
+            self.alive = False
+
+    app.worker_factory = Worker
+    assert app.camera_model_var.get() == "auto"
+    assert tuple(app.camera_model_box["values"]) == ("auto", "D435i", "D415")
+    app.camera_model_var.set("D415")
+    app.connect_button.invoke()
+    assert app.worker.args.camera_model == "D415"
+    assert app.camera_model_box.instate(["disabled"])
+    assert app.args.camera_model == "auto"
+    app._event("camera_lost", {"error": "unplugged", "attempt": 1, "retry_in": 1.})
+    assert app.camera_model_box.instate(["disabled"])
+    app.connect_button.invoke()
+    app._event("disconnected", None)
+    assert app.camera_model_box.instate(["readonly", "!disabled"])
+    app.camera_model_var.set("D435i")
+    app.connect_button.invoke()
+    assert app.worker.args.camera_model == "D435i"
+    app.worker.disconnect()
+
+
 def report(markers, passed=True):
     return {"board_recognized": True, "matched_marker_ids": [1, 2], "expected_marker_ids": [1, 2, 3],
             "missing_marker_ids": [3], "foreign_marker_ids": [], "detected_charuco_corner_count": 4,

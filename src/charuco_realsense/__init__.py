@@ -1,4 +1,4 @@
-"""RealSense D435i detection of charuco-generator ChArUco boards."""
+"""RealSense D435i and D415 detection of charuco-generator ChArUco boards."""
 
 __version__ = "0.1.0"
 

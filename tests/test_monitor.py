@@ -86,6 +86,17 @@ def events(worker):
             return values
 
 
+def test_worker_hardware_recovery_uses_selected_camera_model(worker_setup, monkeypatch):
+    from charuco_realsense import monitor
+    _, _, args = worker_setup
+    args.camera_model = "D415"
+    calls = []
+    monkeypatch.setattr(monitor, "reset_device", lambda serial, model: calls.append((serial, model)) or True)
+    worker = CaptureWorker(args)
+    worker._reset_device()
+    assert calls == [(None, "D415")]
+
+
 def test_worker_records_all_frames_while_preview_drops_old_frames(worker_setup, tmp_path):
     worker, camera, _ = worker_setup
     camera.callback = lambda index: worker.disconnect() if index == 8 else None

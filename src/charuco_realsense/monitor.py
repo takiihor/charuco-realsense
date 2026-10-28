@@ -115,7 +115,8 @@ class CaptureWorker(threading.Thread):
         self.commands = Queue()
         self.stop_requested = threading.Event()
         self.camera_factory = camera_factory or (lambda args: _open_camera(args, self.stop_requested))
-        self.device_reset = device_reset or (lambda args: reset_device(args.serial))
+        self.device_reset = device_reset or (lambda args: reset_device(
+            args.serial, model=getattr(args, "camera_model", "auto")))
         self.shutdown_error = None
         # The requested recording series survives reconnects; the recorder is one part.
         self.request = None

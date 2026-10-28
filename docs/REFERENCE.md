@@ -40,7 +40,9 @@ otherwise 1. Recognition success does not imply pose success or accuracy.
 ## Desktop monitor
 
 Run `./start_camera.sh` to open the UI and connect the camera. Select a board
-before connecting, or disconnect to switch boards. The window shows:
+and **Camera model** (`auto`, `D435i`, or `D415`) before connecting, or disconnect
+to switch them. `--camera-model D415` preselects the D415 at startup; the option
+also applies to CLI capture commands and the headless service. The window shows:
 
 - Live marker outlines and IDs, green ChArUco corners, and the board's pose axes
   (X red, Y green, Z blue; 30 mm long).
@@ -414,13 +416,21 @@ error can coexist with substantial position bias.
 
 ## Stream profiles and USB
 
+Both D435i and D415 use the RealSense SDK and the stream negotiation below.
+`--camera-model auto` keeps automatic device selection; `D435i` and `D415` filter
+by the device's reported model. If multiple devices match, pass `--serial SERIAL`.
+When both options are supplied, the serial must belong to the selected model.
+Reconnection and automatic hardware resets also respect this selection.
+
 Capture binds the selected `--serial` on every startup/fallback attempt. Color-only
 capture is the default because depth is unused by the estimator. Use `--depth` to
 also enable the depth stream; no depth values are currently fused into pose.
 
 The camera first tries the requested profile (default 1280x720@30), then
 1280x720@15, 640x480@30, and 848x480@10. When depth is enabled, fallback depth
-profiles are respectively 640x480@15, 640x480@30, and 848x480@10. The actual profile
+profiles are respectively 640x480@15, 640x480@30, and 848x480@10. Startup verifies
+that a frame arrives before accepting a profile; a five-second timeout releases
+that profile and tries the next fallback. The actual profile
 is recorded. The tested USB 2.1 connection negotiates color 1280x720@15; USB 3.0
 provides more bandwidth. Frame-number gaps should be considered when comparing
 runs with different capture or image-saving settings.
