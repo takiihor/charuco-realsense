@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-28T02:53:06.343347+00:00",
+  "source_recording_id": "run-20261028-105306-331735",
+  "conditions": {
+    "stationary_camera_and_board": true,
+    "camera_model": "RealSense D435I",
+    "stream": {
+      "depth": false,
+      "fps": 15,
+      "height": 720,
+      "width": 1280
+    },
+    "usb_type": "2.1",
+    "calibration_source": "camera_factory",
+    "exposure_locked": false,
+    "temporal_smoothing": false,
+    "software": {
+      "charuco_realsense": "0.1.0",
+      "numpy": "2.3.5",
+      "opencv": "4.11.0"
+    },
+    "pose_options": {
+      "max_error_px": 5.0,
+      "max_rmse_px": 2.0,
+      "min_corners": 6,
+      "min_coverage": 0.25,
+      "min_inlier_fraction": 0.6,
+      "ransac": false,
+      "ransac_threshold_px": 3.0,
+      "refine": false,
+      "solver": "iterative"
+    }
+  },
+  "board": {
+    "name": "tank01",
+    "dictionary": "DICT_6X6_250",
+    "marker_ids": [
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24
+    ],
+    "pattern_dimensions_mm": [
+      80.0,
+      80.0
+    ],
+    "geometry": {
+      "border_bits": 1,
+      "dictionary": "DICT_6X6_250",
+      "legacy_pattern": false,
+      "marker_length_mm": 15.0,
+      "square_length_mm": 20.0,
+      "squares_x": 4,
+      "squares_y": 4
+    }
+  },
+  "sample": {
+    "frames": 1048,
+    "duration_seconds": 69.85075195399986,
+    "fps": 14.989101344098664,
+    "camera_frame_number_gaps": 0,
+    "counts": {
+      "board_recognized": 1048,
+      "full_expected_visibility": 1048,
+      "pose_available": 1048,
+      "pose_quality_passed": 1048
+    },
+    "rates": {
+      "board_recognized": 1.0,
+      "full_expected_visibility": 1.0,
+      "pose_available": 1.0,
+      "pose_quality_passed": 1.0
+    }
+  },
+  "image_fit_rmse_px": {
+    "count": 1048,
+    "max": 0.14574445876545444,
+    "mean": 0.09634132513761014,
+    "p50": 0.09634380986863125,
+    "p95": 0.12352278515366763,
+    "rms": 0.0976297271032524
+  },
+  "board_origin": {
+    "mean_xyz_mm": [
+      9.912943496301901,
+      -48.3912278054522,
+      268.9194296779738
+    ],
+    "sample_std_xyz_mm": [
+      0.03363653704991358,
+      0.011709993397124072,
+      0.15441603756424763
+    ],
+    "rms_3d_displacement_from_mean_mm": 0.15839473028136056,
+    "p95_3d_displacement_from_mean_mm": 0.3025412874444118,
+    "max_3d_displacement_from_mean_mm": 0.5868570919569854,
+    "peak_to_peak_xyz_mm": [
+      0.2119734520912644,
+      0.08436105679952988,
+      1.082997533736659
+    ],
+    "linear_trend_xyz_mm_per_minute": [
+      -0.08190610708804714,
+      -0.006349793314085337,
+      0.14184237157922436
+    ],
+    "first_to_last_10_second_mean_change_xyz_mm": [
+      -0.0858997309813514,
+      -0.0051152355783159464,
+      0.14471231077453695
+    ]
+  },
+  "board_center": {
+    "board_local_coordinates_mm": [
+      40.0,
+      40.0,
+      0.0
+    ],
+    "mean_xyz_mm": [
+      49.73123594797705,
+      -8.265880508529436,
+      266.81185635822897
+    ],
+    "sample_std_xyz_mm": [
+      0.03488966450330307,
+      0.004926165440238253,
+      0.05872458032976276
+    ],
+    "rms_3d_displacement_from_mean_mm": 0.0684518576306477,
+    "p95_3d_displacement_from_mean_mm": 0.12225716127136231,
+    "max_3d_displacement_from_mean_mm": 0.19400691431272904,
+    "peak_to_peak_xyz_mm": [
+      0.1908174742283748,
+      0.030973181353623147,
+      0.37009283371230595
+    ],
+    "linear_trend_xyz_mm_per_minute": [
+      -0.09583240599921555,
+      0.00016011972898395023,
+      0.0017476039280231474
+    ],
+    "first_to_last_10_second_mean_change_xyz_mm": [
+      -0.09957865029852542,
+      0.0013477804039183638,
+      0.008382610768023824
+    ]
+  },
+  "orientation": {
+    "rms_angular_deviation_from_mean_deg": 0.1999548747332588,
+    "p95_angular_deviation_from_mean_deg": 0.346146365921253,
+    "max_angular_deviation_from_mean_deg": 0.5473432168476161,
+    "mean_board_normal_tilt_from_optical_axis_deg": 3.043498638726206
+  },
+  "independent_accuracy_reference": null,
+  "notes": [
+    "Single stationary test; these results are not a hardware accuracy specification.",
+    "Displacements are relative to the sample mean, not an independent ground truth.",
+    "Camera coordinates: X right, Y down, Z forward; board origin is the outer top-left pattern corner.",
+    "The board centre is derived from the same estimated pose at board-local coordinates [40, 40, 0] mm.",
+    "The pattern measures 80 x 80 mm excluding the surrounding white margin."
+  ]
+}
