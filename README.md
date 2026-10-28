@@ -1,7 +1,7 @@
 # charuco-realsense
 
 Live ChArUco detection, camera-frame coordinates, and repeatability measurements
-with an Intel RealSense D435i and boards from
+with an Intel RealSense D435i or D415 and boards from
 [charuco-generator](https://github.com/takiihor/charuco-generator).
 
 ## Start
@@ -12,6 +12,7 @@ You need Python 3.11+ with venv support, plus Tkinter for the desktop UI.
 ```sh
 ./start_camera.sh                 # Open the monitor and connect the camera
 ./start_camera.sh --board tank07  # Select another board in the default set
+./start_camera.sh --camera-model D415  # Connect only to a D415
 ```
 
 The launcher creates `.venv` and installs dependencies automatically. It prefers
@@ -38,6 +39,10 @@ sets share marker IDs but have different geometry. For the 80 mm set, the
 
 ## Use the desktop monitor
 
+- Choose **auto**, **D435i**, or **D415** in **Camera model** before connecting.
+  If already connected, click **Disconnect**, select the model, then **Connect camera**.
+  Auto accepts any single connected RealSense; a model selects only matching devices.
+  With multiple cameras of the same model, launch with `--serial SERIAL`.
 - **X / Y / Z** are millimetres in the camera frame: X right, Y down, Z forward.
   The default point is the checkerboard's outer top-left corner.
 - Click a marker or its table row to show its centre coordinates; click empty
@@ -136,6 +141,7 @@ the Python API, see the [reference guide](docs/REFERENCE.md).
 | Desktop UI cannot open | Install Tk support for the selected Python and use a desktop display; use `service` for headless recording. |
 | Markers detected but pose unavailable or rejected | Show more of the board and check the quality message; the default quality gate needs at least 6 corners. |
 | Lower frame rate than requested | Check the negotiated stream profile and USB connection. The tested USB 2.1 connection uses 1280 × 720 at 15 fps. |
+| D415 detected but no frames received | Check `./start_camera.sh list` for `usb_type`. If it reports `2.1`, try a USB 3 data cable directly into a USB 3 port. A USB 3 port can still negotiate USB 2 with the attached cable. |
 | Camera busy or stuck | Inspect with `./kill.sh --dry-run`, then use `./kill.sh` to stop matching clients. This stops their active capture. |
 
 ## Development and CI

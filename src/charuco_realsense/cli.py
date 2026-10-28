@@ -15,7 +15,7 @@ import numpy as np
 
 from . import __version__
 from .calibration import load_calibration, opencv_calibration
-from .camera import CameraError, RealsenseCamera, StreamConfig, list_devices
+from .camera import CAMERA_MODELS, CameraError, RealsenseCamera, StreamConfig, list_devices
 from .detect import CharucoDetector, Detection, report_for_board
 from .metrics import load_reference_pose, pose_error
 from .pose import PoseInputError, PoseOptions, estimate_pose
@@ -129,7 +129,7 @@ def _draw(overlay: np.ndarray, detection: Detection, pose=None, intrinsics=None,
 def _open_camera(args, stop_event=None):
     return RealsenseCamera(serial=args.serial,
                            config=StreamConfig(args.width, args.height, args.fps, args.depth),
-                           stop_event=stop_event)
+                           stop_event=stop_event, model=getattr(args, "camera_model", "auto"))
 
 
 def _settle_camera(camera, args, stop_event=None, progress=None):
@@ -348,6 +348,8 @@ def parser() -> argparse.ArgumentParser:
     common.add_argument("--manifest", help="Board manifest (default: generator output, then two-stage RealSense 80 mm set)")
     common.add_argument("--generator-path", default=None)
     common.add_argument("--serial", default=None)
+    common.add_argument("--camera-model", choices=CAMERA_MODELS, default="auto",
+                        help="Only connect to this camera model (default: auto)")
     common.add_argument("--width", type=_positive_int, default=1280)
     common.add_argument("--height", type=_positive_int, default=720)
     common.add_argument("--fps", type=_positive_int, default=30)

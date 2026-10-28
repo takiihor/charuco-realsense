@@ -1,8 +1,12 @@
 """Intel RealSense capture; the SDK is imported only when hardware is used."""
 from dataclasses import dataclass
+import re
 import time
 
 import numpy as np
+
+
+CAMERA_MODELS = ("auto", "D435i", "D415")
 
 
 class CameraError(RuntimeError):
@@ -59,17 +63,26 @@ def list_devices() -> list[dict]:
         raise CameraError(f"Cannot list RealSense devices: {exc}") from exc
 
 
-def reset_device(serial: str | None = None) -> bool:
+def _matching_devices(rs, devices, serial=None, model="auto"):
+    if model not in CAMERA_MODELS:
+        raise ValueError(f"Unknown camera model {model!r}; choose from {CAMERA_MODELS}")
+    if serial is not None:
+        devices = [d for d in devices if d.get_info(rs.camera_info.serial_number) == serial]
+    if model != "auto":
+        devices = [d for d in devices if re.search(rf"\b{re.escape(model)}\b",
+                                                  d.get_info(rs.camera_info.name), re.IGNORECASE)]
+    return devices
+
+
+def reset_device(serial: str | None = None, model: str = "auto") -> bool:
     """Hardware-reset an enumerable, idle camera to recover a wedged USB device.
 
     The device re-enumerates a few seconds later. Returns False if no matching
-    device is visible; with no serial, only a single connected device is reset.
+    device is visible; only a single device matching the serial/model is reset.
     """
     rs = _realsense()
     try:
-        devices = list(rs.context().query_devices())
-        if serial is not None:
-            devices = [d for d in devices if d.get_info(rs.camera_info.serial_number) == serial]
+        devices = _matching_devices(rs, list(rs.context().query_devices()), serial, model)
         if len(devices) != 1:
             return False
         devices[0].hardware_reset()
@@ -87,7 +100,8 @@ _FALLBACKS = ((1280, 720, 15, 640, 480, 15),
 class RealsenseCamera:
     """A selected device's color stream, with optional depth for future fusion."""
 
-    def __init__(self, serial: str | None = None, config: StreamConfig = StreamConfig(), stop_event=None):
+    def __init__(self, serial: str | None = None, config: StreamConfig = StreamConfig(), stop_event=None,
+                 model: str = "auto"):
         self._rs = rs = _realsense()
         self._stop_event = stop_event
         self._started = False
@@ -95,13 +109,14 @@ class RealsenseCamera:
         try:
             self._check_cancelled()
             self._ctx = rs.context()
-            self._device = self._select_device(serial)
+            self._device = self._select_device(serial, model)
             self.serial = self._device.get_info(rs.camera_info.serial_number)
+            self._connection_info = _device_info(rs, self._device)
             self._pipeline = rs.pipeline(self._ctx)
             requested = (config.width, config.height, config.fps,
                          config.width, config.height, config.fps)
             candidates = [requested] + [c for c in _FALLBACKS if c != requested]
-            last_error = None
+            last_error = frame_error = None
             for cw, ch, cfps, dw, dh, dfps in candidates:
                 self._check_cancelled()
                 pipeline_config = rs.config()
@@ -132,8 +147,18 @@ class RealsenseCamera:
                     depth = profile.get_stream(rs.stream.depth).as_video_stream_profile()
                     self.actual_config["depth_profile"] = {"width": depth.width(), "height": depth.height(), "fps": depth.fps()}
                     self.stream_info += f" + depth {depth.width()}x{depth.height()}@{depth.fps()}"
+                try:
+                    # Some devices accept a profile but never deliver frames.
+                    # Verify delivery before treating startup as successful.
+                    self.read()
+                except CameraCancelled:
+                    raise
+                except CameraError as exc:
+                    frame_error = exc
+                    self.close()
+                    continue
                 return
-            raise CameraError(f"No stream profile resolved (last error: {last_error}); "
+            raise CameraError(f"No working stream profile (last error: {frame_error or last_error}); "
                               "try USB 3.0, a lower profile, or disabling --depth")
         except BaseException as exc:
             self.close()
@@ -145,19 +170,21 @@ class RealsenseCamera:
         if self._stop_event is not None and self._stop_event.is_set():
             raise CameraCancelled("Camera shutdown requested")
 
-    def _select_device(self, serial: str | None):
-        devices = self._ctx.query_devices()
+    def _select_device(self, serial: str | None, model: str):
+        devices = list(self._ctx.query_devices())
         if not devices:
             raise CameraError("No RealSense device found; connect it and check the USB cable")
+        available = [_device_info(self._rs, d) for d in devices]
+        devices = _matching_devices(self._rs, devices, serial, model)
+        if not devices:
+            selection = f"RealSense {model}" if model != "auto" else "RealSense device"
+            if serial is not None:
+                selection += f" with serial {serial!r}"
+            raise CameraError(f"{selection} not found; available: {available}")
         serials = [d.get_info(self._rs.camera_info.serial_number) for d in devices]
-        if serial is None:
-            if len(devices) > 1:
-                raise CameraError(f"Multiple RealSense devices connected; select --serial from {serials}")
-            return devices[0]
-        for device, candidate in zip(devices, serials):
-            if candidate == serial:
-                return device
-        raise CameraError(f"RealSense serial {serial!r} not found; available: {serials}")
+        if len(devices) > 1:
+            raise CameraError(f"Multiple RealSense devices match model {model!r}; select --serial from {serials}")
+        return devices[0]
 
     @property
     def intrinsics(self) -> dict:
@@ -216,7 +243,12 @@ class RealsenseCamera:
                 if available:
                     break
                 if time.monotonic() >= deadline:
-                    raise CameraError("No RealSense frames received for 5 seconds; check the camera connection")
+                    info = self._connection_info
+                    name = info.get("name", "RealSense camera")
+                    usb = info.get("usb_type", "unknown")
+                    hint = ("Use a USB 3 data cable and USB 3 port without a hub or extension"
+                            if usb.startswith("2") else "Check the USB cable and camera connection")
+                    raise CameraError(f"No RealSense frames received for 5 seconds ({name}, USB {usb}); {hint}")
             self._check_cancelled()
             color = frames.get_color_frame()
             if not color:
