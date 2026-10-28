@@ -21,6 +21,14 @@ The generator is installed with `--no-deps` because its headless OpenCV dependen
 conflicts with this project's GUI OpenCV build. `./start_camera.sh` can also set
 up the environment and run any command below.
 
+The launcher uses `../charuco-generator/output/board_manifest.json` when it exists.
+Otherwise it uses the two-stage RealSense **80 mm** board set at
+`../charuco-generator/output/two_stage/stage2_charuco_realsense_80mm/board_manifest.json`.
+The desktop UI selects `front` when available, or the first board (normally
+`tank01` in the two-stage set). It prints the selected manifest and board dimensions
+at startup. Pass `--manifest` to use a different generated set; the 32 mm Basler
+boards require their own manifest even though they share the 80 mm set's marker IDs.
+
 ## Usage
 
 ```sh
@@ -28,6 +36,11 @@ up the environment and run any command below.
 ./start_camera.sh
 # Or explicitly select a board
 .venv/bin/python main.py gui --board front
+
+# Select a tank board from the default set
+./start_camera.sh --board tank07
+# Use the 32 mm boards instead
+./start_camera.sh --manifest ../charuco-generator/output/two_stage/stage2_charuco_basler_32mm/board_manifest.json --board tank07
 
 # Desktop UI that starts recording on its own (for unattended stations)
 ./start_camera.sh gui --board front --auto-record

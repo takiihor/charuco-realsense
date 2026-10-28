@@ -22,7 +22,21 @@ from .pose import PoseInputError, PoseOptions, estimate_pose
 from .recording import SessionRecorder, summarize_recording, write_json
 
 
-def _load_board(manifest_path: str, board_name: str, generator_path: str | None):
+def _default_manifest(generator_path: str | None) -> str:
+    output = Path(generator_path or "../charuco-generator") / "output"
+    candidates = (
+        output / "board_manifest.json",
+        output / "two_stage" / "stage2_charuco_realsense_80mm" / "board_manifest.json",
+    )
+    for path in candidates:
+        if path.is_file():
+            return str(path)
+    searched = ", ".join(str(path) for path in candidates)
+    raise ValueError(f"No default ChArUco manifest found (checked {searched}). "
+                     "Generate boards with charuco-generator, or pass --manifest PATH --board NAME.")
+
+
+def _load_board(manifest_path: str, board_name: str | None, generator_path: str | None):
     if generator_path is not None:
         sys.path.insert(0, str(Path(generator_path) / "src"))
     try:
@@ -31,10 +45,16 @@ def _load_board(manifest_path: str, board_name: str, generator_path: str | None)
     except ImportError as exc:
         raise ValueError("Install charuco-generator with --no-deps or supply --generator-path") from exc
     manifest = load_manifest(manifest_path)
-    board = reconstruct_board(manifest, board_name)
+    if not manifest.get("boards"):
+        raise ValueError(f"No ChArUco boards in {manifest_path}; pass a ChArUco board manifest with --manifest")
+    if board_name is None:
+        names = [record["name"] for record in manifest["boards"]]
+        board_name = "front" if "front" in names else names[0]
     record = next((b for b in manifest["boards"] if b["name"] == board_name), None)
     if record is None:
-        raise ValueError(f"Unknown board {board_name!r}")
+        names = ", ".join(b["name"] for b in manifest["boards"])
+        raise ValueError(f"Unknown board {board_name!r} in {manifest_path}. Available boards: {names}")
+    board = reconstruct_board(manifest, board_name)
     return board, record, manifest
 
 
@@ -325,8 +345,7 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("list", help="List connected RealSense devices")
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--manifest", default="../charuco-generator/output/board_manifest.json")
-    common.add_argument("--board", required=True, help="Board name, e.g. front")
+    common.add_argument("--manifest", help="Board manifest (default: generator output, then two-stage RealSense 80 mm set)")
     common.add_argument("--generator-path", default=None)
     common.add_argument("--serial", default=None)
     common.add_argument("--width", type=_positive_int, default=1280)
@@ -348,6 +367,7 @@ def parser() -> argparse.ArgumentParser:
     common.add_argument("--min-inlier-fraction", type=_fraction, default=.6)
 
     detect = commands.add_parser("detect", parents=[common], help="Detect in an image or select best camera frame")
+    detect.add_argument("--board", required=True, help="Board name, e.g. front or tank01")
     detect.add_argument("--image", default=None)
     detect.add_argument("--frames", type=_positive_int, default=5, help="Sample N camera frames; retain best by corner count")
     detect.add_argument("--report", default=None)
@@ -376,14 +396,17 @@ def parser() -> argparse.ArgumentParser:
     monitor.set_defaults(frames=None, seconds=None)
 
     gui = commands.add_parser("gui", parents=[common, monitor], help="Desktop camera monitor with jitter charts and recording controls")
+    gui.add_argument("--board", help="Board name (default: front if present, otherwise the first board)")
     gui.add_argument("--auto-record", action="store_true", help="Start recording as soon as the camera is ready")
 
     service = commands.add_parser("service", parents=[common, monitor],
                                   help="Headless 24/7 recorder: reconnects, rotates parts, logs, systemd watchdog")
+    service.add_argument("--board", required=True, help="Board name, e.g. front or tank01")
     service.add_argument("--no-record", action="store_true", help="Monitor and log camera health without recording")
 
     for name in ("stream", "benchmark"):
         capture = commands.add_parser(name, parents=[common], help="Live GUI" if name == "stream" else "Record raw measurements and jitter statistics")
+        capture.add_argument("--board", required=True, help="Board name, e.g. front or tank01")
         capture.add_argument("--frames", type=_positive_int, default=None, help="Stop after N recorded frames")
         capture.add_argument("--seconds", type=_positive_float, default=60. if name == "benchmark" else None)
         capture.add_argument("--reference-pose", help="Independent static ground-truth pose JSON")
@@ -404,6 +427,8 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if hasattr(args, "manifest") and args.manifest is None:
+            args.manifest = _default_manifest(args.generator_path)
         if args.command == "list":
             for device in list_devices():
                 print(json.dumps(device, sort_keys=True, allow_nan=False))

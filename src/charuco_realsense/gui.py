@@ -1102,12 +1102,18 @@ def run_gui(args):
         from PIL import ImageTk  # noqa: F401
     except ImportError as exc:
         raise ValueError("Desktop UI needs Tkinter and Pillow. Install Python's Tk support and pip install -e '.[gui]'.") from exc
-    _, _, manifest = _load_board(args.manifest, args.board, args.generator_path)
+    _, record, manifest = _load_board(args.manifest, args.board, args.generator_path)
+    args.board = record["name"]
+    geometry = record["geometry"]
+    width = geometry["squares_x"] * geometry["square_length_mm"]
+    height = geometry["squares_y"] * geometry["square_length_mm"]
+    selection = f"Board {args.board!r} ({width:g} x {height:g} mm); manifest: {args.manifest}"
     try:
         root = tk.Tk()
     except tk.TclError as exc:
         raise ValueError(f"Cannot open desktop UI: {exc}. Use a desktop display or the service command.") from exc
     log_path = configure_logging(default_log_file(args))
+    log.info(selection)
     with SignalStop() as shutdown:
         app = MonitorApp(root, args, [board["name"] for board in manifest["boards"]], shutdown=shutdown, log_path=log_path)
         try:
